@@ -2593,9 +2593,10 @@ function openConfigPanel() {
     document.getElementById('mm-config-mask').classList.add('mm-config-open');
 }
 
-
 jQuery(async () => {
     loadSettings(); createUi();
+
+
     let timer, longP;
 
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (id) => {
