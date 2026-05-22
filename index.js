@@ -66,30 +66,134 @@ function parsePattern(str) {
 
 async function loadAllWbEntries() {
     const ctx = getContext();
-    const worlds = new Set();
-    const charWorld = ctx.characters?.[ctx.characterId]?.data?.extensions?.world;
-    if (charWorld) worlds.add(charWorld);
-    const chatWorld = ctx.chatMetadata?.world_info;
-    if (chatWorld) worlds.add(chatWorld);
-    const allEntries = [];
-    for (const worldName of worlds) {
-        const data = await ctx.loadWorldInfo(worldName);
-        if (data?.entries) {
-            for (const entry of Object.values(data.entries)) {
-                if (!entry.disable) {
-                    allEntries.push({
-                        key: `${worldName}::${entry.uid}`,
-                        title: entry.comment || `条目 ${entry.uid}`,
-                        content: entry.content || '',
-                        worldName,
-                        uid: entry.uid,
-                    });
+    const worldMap = new Map();
+
+    // 1. 角色绑定
+    try {
+        const charWorld = ctx.characters?.[ctx.characterId]?.data?.extensions?.world;
+        if (charWorld) worldMap.set(charWorld, '📌 角色绑定');
+    } catch (_) {}
+
+    // 2. 聊天绑定
+    try {
+        const chatWorld = ctx.chatMetadata?.world_info;
+        if (chatWorld && !worldMap.has(chatWorld)) worldMap.set(chatWorld, '💬 聊天绑定');
+    } catch (_) {}
+
+    // 3. 全局启用
+    try {
+        const selWorlds = ctx.selected_world_info || ctx.selectedWorldInfo || [];
+        if (Array.isArray(selWorlds)) {
+            for (const n of selWorlds) {
+                if (n && !worldMap.has(n)) worldMap.set(n, '🌐 全局启用');
+            }
+        }
+    } catch (_) {}
+
+    // 4. 从 world-info.js 模块获取全部世界书名
+    try {
+        const wiModule = await import('../../../world-info.js');
+        const wn = wiModule.world_names;
+        if (Array.isArray(wn)) {
+            for (const n of wn) {
+                if (n && typeof n === 'string' && !worldMap.has(n)) {
+                    worldMap.set(n, '📚 可用');
                 }
             }
+        }
+    } catch (e) {
+        console.warn('[MiniMax] world-info.js 导入失败:', e.message);
+    }
+
+    // 5. DOM 兜底：从界面下拉框抓取
+    if (worldMap.size === 0) {
+        try {
+            const selectors = [
+                '#world_info select option',
+                '#world_editor_select option',
+                'select[name*="world"] option',
+                '.world_info_selector option',
+            ];
+            for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach(opt => {
+                    const n = (opt.value || opt.textContent || '').trim();
+                    if (n && n !== '' && n.toLowerCase() !== 'none' && !worldMap.has(n)) {
+                        worldMap.set(n, '📚 可用');
+                    }
+                });
+            }
+        } catch (_) {}
+    }
+
+    // 6. API 兜底
+    if (worldMap.size === 0) {
+        try {
+            const res = await fetch('/api/worldinfo/settings', {
+                method: 'POST',
+                headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                const names = data.world_names || data.worldNames || [];
+                for (const n of names) {
+                    if (n && !worldMap.has(n)) worldMap.set(n, '📚 可用');
+                }
+            }
+        } catch (_) {}
+    }
+
+    if (worldMap.size === 0) {
+        console.warn('[MiniMax] 未找到任何世界书');
+        return [];
+    }
+
+    console.log('[MiniMax] 发现世界书:', [...worldMap.keys()]);
+
+    // 逐个加载条目
+    const allEntries = [];
+    for (const [worldName, source] of worldMap) {
+        try {
+            let data = null;
+            if (typeof ctx.loadWorldInfo === 'function') {
+                data = await ctx.loadWorldInfo(worldName);
+            }
+            if (!data || !data.entries) {
+                try {
+                    const res = await fetch('/api/worldinfo/get', {
+                        method: 'POST',
+                        headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: worldName }),
+                    });
+                    if (res.ok) data = await res.json();
+                } catch (_) {}
+            }
+            if (!data || !data.entries) continue;
+
+            for (const entry of Object.values(data.entries)) {
+                const keys = [];
+                if (Array.isArray(entry.key)) keys.push(...entry.key);
+                else if (typeof entry.key === 'string' && entry.key) keys.push(...entry.key.split(',').map(k => k.trim()).filter(Boolean));
+                if (Array.isArray(entry.keysecondary)) keys.push(...entry.keysecondary);
+
+                allEntries.push({
+                    key: worldName + '::' + entry.uid,
+                    title: entry.comment || ('条目 ' + entry.uid),
+                    content: entry.content || '',
+                    worldName: worldName,
+                    source: source,
+                    uid: entry.uid,
+                    disabled: !!entry.disable,
+                    keys: keys,
+                });
+            }
+        } catch (e) {
+            console.warn('[MiniMax] 加载世界书 "' + worldName + '" 失败:', e.message);
         }
     }
     return allEntries;
 }
+
 
 function applyPreProcessRules(text) {
     const rules = (s().llmPreProcessRules || []).filter(r => r.enabled && r.pattern);
@@ -541,6 +645,16 @@ function injectAfterText(container, searchText, insertEl) {
     return false;
 }
 
+function injectAfterClosingQuote(container, innerText, insertEl) {
+    if (!innerText) return false;
+    const CLOSE_QUOTES = ['"', '\u201d', '\u300d', '\u300f', '\u2019', "'"];
+    for (const closeQ of CLOSE_QUOTES) {
+        const target = innerText + closeQ;
+        if (injectAfterText(container, target, insertEl)) return true;
+    }
+    return false;
+}
+
 function injectBubbles(mesid) {
     if (!s().showBubbles) return;
     if (document.getElementById('minimax_quote_tts_editor')) return;
@@ -552,6 +666,7 @@ function injectBubbles(mesid) {
     if (!mesEl) return;
     const textEl = mesEl.querySelector('.mes_text');
     if (!textEl) return;
+
     const allItems = h?.versions?.[h.activeIndex]?.items || [];
     const items = allItems.map((it, idx) => ({ it, idx })).filter(({ it }) => !it.pauseMs && it.text);
 
@@ -562,24 +677,43 @@ function injectBubbles(mesid) {
         return;
     }
 
+    // 清除旧气泡
     textEl.querySelectorAll('.mm-bubble').forEach(el => el.remove());
     textEl.querySelector('.mm-bubble-strip')?.remove();
-    if (!items.length) { delete textEl.dataset.mmBubVer; return; } 
+    if (!items.length) { delete textEl.dataset.mmBubVer; return; }
+
+    // 判断是否为「引号提取」模式
+    const isQuoteMode = !s().formatterEnabled && (s().regexRules || []).some(
+        r => r.enabled && r.mode === 'extract'
+    );
 
     const unmatched = [];
+
     items.forEach(({ it: item, idx }) => {
         const bubble = makeBubble(mesid, idx, item, false);
-        if (!injectAfterText(textEl, item.text, bubble)) {
-            unmatched.push({ item, idx });
+
+        if (isQuoteMode) {
+            // 引号模式：只在「文本+闭合引号」处注入
+            if (!injectAfterClosingQuote(textEl, item.text, bubble)) {
+                unmatched.push({ item, idx });
+            }
+        } else {
+            // LLM 格式化模式：按原逻辑找裸文本
+            if (!injectAfterText(textEl, item.text, bubble)) {
+                unmatched.push({ item, idx });
+            }
         }
     });
 
-    if (unmatched.length) {
+    // 引号模式下不显示底部条（旁白不出气泡）
+    // LLM 模式下才显示底部条
+    if (unmatched.length && !isQuoteMode) {
         const strip = document.createElement('div');
         strip.className = 'mm-bubble-strip';
         unmatched.forEach(({ item, idx }) => strip.appendChild(makeBubble(mesid, idx, item, true)));
         textEl.appendChild(strip);
     }
+
     textEl.dataset.mmBubVer = ver;
 }
 
@@ -1354,27 +1488,227 @@ function renderVcBlocks() {
         el.querySelector('.mm-wb-manage')?.addEventListener('click', async () => {
             const blockRef = s().vcPromptBlocks[i];
             let entries;
-            try { entries = await loadAllWbEntries(); } catch(e) { toastr.error('加载世界书失败: ' + e.message); return; }
-            if (!entries.length) { toastr.warning('未找到当前角色的世界书条目'); return; }
+            try {
+                entries = await loadAllWbEntries();
+            } catch (e) {
+                toastr.error('加载世界书失败: ' + e.message);
+                return;
+            }
+
+            if (!entries.length) {
+                const ctx = getContext();
+                const hints = [
+                    '未找到任何世界书条目。请检查：',
+                    '',
+                    '1. 是否已在酒馆中创建或导入了世界书？',
+                    '2. 世界书是否已绑定到当前角色或全局启用？',
+                    `   当前角色: ${ctx.name2 || '(无)'}`,
+                    `   角色绑定世界书: ${ctx.characters?.[ctx.characterId]?.data?.extensions?.world || '(无)'}`,
+                    `   聊天绑定世界书: ${ctx.chatMetadata?.world_info || '(无)'}`,
+                    '',
+                    '提示：在酒馆的世界书面板中为角色绑定世界书，或全局启用后重试。',
+                ];
+                await callGenericPopup(
+                    `<div style="white-space:pre-wrap;font-size:0.9rem;line-height:1.6">${hints.join('\n')}</div>`,
+                    POPUP_TYPE.TEXT,
+                    '未找到世界书',
+                );
+                return;
+            }
+
             const selected = new Set(blockRef.selectedEntries || []);
+
+            // 按世界书名分组
+            const grouped = new Map();
+            for (const entry of entries) {
+                if (!grouped.has(entry.worldName)) {
+                    grouped.set(entry.worldName, { source: entry.source || '📚', entries: [] });
+                }
+                grouped.get(entry.worldName).entries.push(entry);
+            }
+
+            // 构建弹窗
             const wrap = document.createElement('div');
-            wrap.style.cssText = 'max-height:55vh;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:4px';
-            entries.forEach(entry => {
-                const label = document.createElement('label');
-                label.style.cssText = 'display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:6px 8px;border-radius:6px;background:rgba(128,128,128,0.06);user-select:none';
-                const cb = document.createElement('input');
-                cb.type = 'checkbox'; cb.checked = selected.has(entry.key);
-                cb.style.cssText = 'margin-top:2px;flex-shrink:0';
-                const info = document.createElement('div');
-                info.style.cssText = 'flex:1;min-width:0;font-size:0.85rem';
-                info.innerHTML = `<div style="font-weight:600">${escHtml(entry.title)}</div><div style="opacity:0.5;font-size:0.78rem;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${escHtml(entry.content.slice(0, 120))}${entry.content.length > 120 ? '…' : ''}</div>`;
-                cb.addEventListener('change', () => { cb.checked ? selected.add(entry.key) : selected.delete(entry.key); });
-                label.appendChild(cb); label.appendChild(info);
-                wrap.appendChild(label);
+            wrap.style.cssText = 'max-height:60vh;overflow-y:auto;display:flex;flex-direction:column;gap:0;padding:0';
+
+            // 搜索框
+            const searchBox = document.createElement('input');
+            searchBox.type = 'text';
+            searchBox.placeholder = '🔍 搜索条目名称 / 关键词 / 内容...';
+            searchBox.className = 'text_pole';
+            searchBox.style.cssText = 'margin:0 0 10px;position:sticky;top:0;z-index:1;background:var(--SmartThemeBlurTintColor,#1a1c2a)';
+            wrap.appendChild(searchBox);
+
+            // 统计栏
+            const statsBar = document.createElement('div');
+            statsBar.style.cssText = 'font-size:0.78rem;opacity:0.55;margin-bottom:8px;padding:0 4px;position:sticky;top:38px;z-index:1;background:var(--SmartThemeBlurTintColor,#1a1c2a)';
+            const updateStats = () => {
+                statsBar.textContent = `共 ${grouped.size} 本世界书，${entries.length} 个条目，已选 ${selected.size} 个`;
+            };
+            updateStats();
+            wrap.appendChild(statsBar);
+
+            const allEntryEls = [];
+
+            for (const [worldName, group] of grouped) {
+                const groupEl = document.createElement('div');
+                groupEl.style.cssText = 'margin-bottom:8px';
+
+                const header = document.createElement('div');
+                header.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 8px 6px;cursor:pointer;border-radius:8px;background:rgba(128,128,128,0.08);user-select:none';
+                header.innerHTML = `
+                    <span style="font-size:0.72rem;opacity:0.45;transform:rotate(0deg);transition:transform 0.2s;display:inline-block" class="mm-wb-arrow">▶</span>
+                    <span style="font-weight:600;font-size:0.92rem;flex:1">${escHtml(worldName)}</span>
+                    <span style="font-size:0.72rem;opacity:0.5;padding:2px 8px;border-radius:10px;background:rgba(128,128,128,0.12)">${escHtml(group.source)}</span>
+                    <span style="font-size:0.72rem;opacity:0.45">${group.entries.length} 条</span>
+                `;
+
+                const body = document.createElement('div');
+                body.style.cssText = 'display:none;flex-direction:column;gap:2px;padding:4px 0 0 18px';
+
+                let expanded = false;
+                header.addEventListener('click', (e) => {
+                    if (e.target.closest('.mm-wb-sel-all')) return;
+                    expanded = !expanded;
+                    body.style.display = expanded ? 'flex' : 'none';
+                    header.querySelector('.mm-wb-arrow').style.transform = expanded ? 'rotate(90deg)' : 'rotate(0deg)';
+                });
+
+                // 全选按钮
+                const selAllBtn = document.createElement('button');
+                selAllBtn.className = 'menu_button mm-wb-sel-all';
+                selAllBtn.style.cssText = 'padding:1px 8px;font-size:0.72rem;margin-left:4px';
+                selAllBtn.textContent = '全选';
+                selAllBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const groupKeys = group.entries.map(en => en.key);
+                    const allSelected = groupKeys.every(k => selected.has(k));
+                    for (const ent of group.entries) {
+                        if (allSelected) selected.delete(ent.key);
+                        else selected.add(ent.key);
+                    }
+                    allEntryEls.forEach(({ cb, entry: ent }) => {
+                        if (ent.worldName === worldName) cb.checked = selected.has(ent.key);
+                    });
+                    selAllBtn.textContent = allSelected ? '全选' : '取消全选';
+                    updateStats();
+                });
+                header.appendChild(selAllBtn);
+                groupEl.appendChild(header);
+
+                // 条目
+                for (const entry of group.entries) {
+                    const row = document.createElement('label');
+                    row.style.cssText = 'display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:7px 8px;border-radius:6px;background:rgba(128,128,128,0.03);transition:background 0.1s';
+                    row.addEventListener('mouseenter', () => row.style.background = 'rgba(128,128,128,0.1)');
+                    row.addEventListener('mouseleave', () => row.style.background = 'rgba(128,128,128,0.03)');
+
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.checked = selected.has(entry.key);
+                    cb.style.cssText = 'margin-top:3px;flex-shrink:0';
+                    cb.addEventListener('change', () => {
+                        cb.checked ? selected.add(entry.key) : selected.delete(entry.key);
+                        updateStats();
+                    });
+
+                    const info = document.createElement('div');
+                    info.style.cssText = 'flex:1;min-width:0;font-size:0.84rem';
+
+                    const titleLine = document.createElement('div');
+                    titleLine.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap';
+                    titleLine.innerHTML = `<span style="font-weight:600">${escHtml(entry.title)}</span>`;
+                    if (entry.disabled) {
+                        titleLine.innerHTML += `<span style="font-size:0.68rem;color:#ef5350;background:rgba(239,83,80,0.1);padding:1px 6px;border-radius:8px">已禁用</span>`;
+                    }
+                    info.appendChild(titleLine);
+
+                    // 关键词标签
+                    const keys = entry.keys || [];
+                    if (keys.length) {
+                        const keysEl = document.createElement('div');
+                        keysEl.style.cssText = 'margin-top:2px;display:flex;flex-wrap:wrap;gap:3px';
+                        keys.slice(0, 8).forEach(k => {
+                            const tag = document.createElement('span');
+                            tag.style.cssText = 'font-size:0.68rem;padding:1px 6px;border-radius:8px;background:rgba(110,160,255,0.1);color:rgba(110,160,255,0.8)';
+                            tag.textContent = k;
+                            keysEl.appendChild(tag);
+                        });
+                        if (keys.length > 8) {
+                            const more = document.createElement('span');
+                            more.style.cssText = 'font-size:0.68rem;opacity:0.4';
+                            more.textContent = `+${keys.length - 8}`;
+                            keysEl.appendChild(more);
+                        }
+                        info.appendChild(keysEl);
+                    }
+
+                    // 可展开内容预览
+                    if (entry.content) {
+                        const preview = document.createElement('div');
+                        preview.style.cssText = 'opacity:0.45;font-size:0.76rem;margin-top:3px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;cursor:pointer;line-height:1.4';
+                        preview.textContent = entry.content.slice(0, 200) + (entry.content.length > 200 ? '…' : '');
+                        preview.title = '点击展开/收起';
+                        let contentExpanded = false;
+                        preview.addEventListener('click', (ev) => {
+                            ev.preventDefault(); ev.stopPropagation();
+                            contentExpanded = !contentExpanded;
+                            if (contentExpanded) {
+                                preview.style.display = 'block';
+                                preview.style.webkitLineClamp = 'unset';
+                                preview.textContent = entry.content;
+                            } else {
+                                preview.style.display = '-webkit-box';
+                                preview.style.webkitLineClamp = '2';
+                                preview.textContent = entry.content.slice(0, 200) + (entry.content.length > 200 ? '…' : '');
+                            }
+                        });
+                        info.appendChild(preview);
+                    }
+
+                    row.appendChild(cb);
+                    row.appendChild(info);
+                    body.appendChild(row);
+                    allEntryEls.push({ el: row, entry, cb });
+                }
+
+                groupEl.appendChild(body);
+                wrap.appendChild(groupEl);
+            }
+
+            // 搜索
+            searchBox.addEventListener('input', () => {
+                const q = searchBox.value.trim().toLowerCase();
+                for (const { el: rowEl, entry } of allEntryEls) {
+                    if (!q) { rowEl.style.display = ''; continue; }
+                    const match =
+                        entry.title.toLowerCase().includes(q) ||
+                        entry.content.toLowerCase().includes(q) ||
+                        entry.worldName.toLowerCase().includes(q) ||
+                        (entry.keys || []).some(k => k.toLowerCase().includes(q));
+                    rowEl.style.display = match ? '' : 'none';
+                }
+                if (q) {
+                    wrap.querySelectorAll('.mm-wb-arrow').forEach(arrow => {
+                        arrow.style.transform = 'rotate(90deg)';
+                        const bd = arrow.closest('div')?.parentElement?.querySelector('div:last-child');
+                        if (bd) bd.style.display = 'flex';
+                    });
+                }
             });
-            const ok = await callGenericPopup(wrap, POPUP_TYPE.CONFIRM, '选择注入的世界书条目', { wide: true, okButton: '确认', cancelButton: '取消' });
-            if (ok) { blockRef.selectedEntries = [...selected]; saveSettingsDebounced(); renderVcBlocks(); }
+
+            const ok = await callGenericPopup(
+                wrap, POPUP_TYPE.CONFIRM,
+                `选择世界书条目 (${entries.length} 条来自 ${grouped.size} 本)`,
+                { wide: true, okButton: '确认', cancelButton: '取消' },
+            );
+            if (ok) {
+                blockRef.selectedEntries = [...selected];
+                saveSettingsDebounced();
+                renderVcBlocks();
+            }
         });
+
         el.querySelector('.mm-del-block')?.addEventListener('click', () => {
             s().vcPromptBlocks.splice(i, 1); saveSettingsDebounced(); renderVcBlocks();
         });
