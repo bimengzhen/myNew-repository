@@ -9,6 +9,7 @@ const API_HOST_OPTIONS = [
     { value: 'https://api.minimax.chat',   label: '国内源 (api.minimax.chat)' },
     { value: 'https://api.minimax.io',     label: '国际源 (api.minimax.io)' },
     { value: 'https://api.minimaxi.chat',  label: '备用源 (api.minimaxi.chat)' },
+    { value: 'custom',                     label: '🔗 自定义中转站' },
 ];
 
 const TARGET_TYPE = { CURRENT_CHARACTER: 'current_character', CURRENT_USER: 'current_user', CUSTOM: 'custom' };
@@ -16,12 +17,19 @@ const API_FORMATS = { OAI: 'openai', GOOGLE: 'google' };
 
 
 const MODEL_OPTIONS = [
-    { value: 'speech-02-hd',    label: 'speech-02-hd (高清)' },
-    { value: 'speech-02-turbo', label: 'speech-02-turbo (极速)' },
-    { value: 'speech-01-hd',    label: 'speech-01-hd (高清旧版)' },
-    { value: 'speech-01-turbo', label: 'speech-01-turbo (极速旧版)' },
-    { value: 'speech-01',       label: 'speech-01 (标准)' },
+    { value: 'Speech-2.8-turbo',          label: 'Speech-2.8-turbo (最新极速)' },
+    { value: 'Speech-2.8-hd',             label: 'Speech-2.8-hd (最新高清)' },
+    { value: 'Speech-2.6-turbo',          label: 'Speech-2.6-turbo' },
+    { value: 'Speech-2.6-hd',             label: 'Speech-2.6-hd' },
+    { value: 'minimax-speech-2.5-turbo',  label: 'minimax-speech-2.5-turbo' },
+    { value: 'minimax-speech-2.5-hd',     label: 'minimax-speech-2.5-hd' },
+    { value: 'speech-02-hd',              label: 'speech-02-hd (旧版)' },
+    { value: 'speech-02-turbo',           label: 'speech-02-turbo (旧版)' },
+    { value: 'speech-01-turbo',           label: 'speech-01-turbo (旧版)' },
+    { value: 'speech-01-hd',              label: 'speech-01-hd (旧版)' },
+    { value: 'speech-01',                 label: 'speech-01 (旧版)' },
 ];
+
 
 const defaults = {
     enabled: true, autoPlay: true, showMessageButton: true, onlyCharacter: true,
@@ -327,15 +335,27 @@ async function proxyFetch(url, options = {}) {
     return data;
 }
 
-// ★ 修复4: 直连 MiniMax API fallback（当 ST 代理端点不可用时）
 async function directMinimaxTts(text, options) {
     const set = s();
     const apiKey = (set.apiKey || '').trim();
     const groupId = (set.groupId || '').trim();
-    if (!apiKey) throw new Error('请先填写 MiniMax API Key');
+    if (!apiKey) throw new Error('请先填写 API Key');
 
-    const apiHost = (set.apiHost || DEFAULT_API_HOST).replace(/\/+$/, '');
-    const url = `${apiHost}/v1/t2a_v2?GroupId=${encodeURIComponent(groupId)}`;
+    // 判断是官方 API 还是中转站
+    let apiHost = (set.apiHost || DEFAULT_API_HOST).replace(/\/+$/, '');
+    let url;
+    let isRelay = false;
+
+    if (apiHost === 'custom') {
+        // 自定义中转站：直接使用用户填写的完整 URL
+        const customHost = (set.customApiHost || '').trim().replace(/\/+$/, '');
+        if (!customHost) throw new Error('请在「中转地址」中填写中转站 URL');
+        url = customHost;
+        isRelay = true;
+    } else {
+        // 官方 API
+        url = `${apiHost}/v1/t2a_v2?GroupId=${encodeURIComponent(groupId)}`;
+    }
 
     const body = {
         model: options.model || set.model,
@@ -355,6 +375,18 @@ async function directMinimaxTts(text, options) {
     if (options.emotion) body.voice_setting.emotion = options.emotion;
     if (options.language) body.voice_setting.language_boost = options.language;
 
+    // 中转站可能用不同的字段名，做兼容
+    if (isRelay) {
+        // 有些中转站用 voice_id 顶层字段
+        body.voice_id = body.voice_setting.voice_id;
+        // 有些中转站要 speed/vol 在顶层
+        body.speed = body.voice_setting.speed;
+        body.vol = body.voice_setting.vol;
+        body.pitch = body.voice_setting.pitch;
+    }
+
+    console.log('[MiniMax TTS] 请求:', url, 'model:', body.model, 'relay:', isRelay);
+
     const res = await fetch(url, {
         method: 'POST',
         headers: {
@@ -366,16 +398,29 @@ async function directMinimaxTts(text, options) {
 
     if (!res.ok) {
         let msg = `HTTP ${res.status}`;
-        try { const e = await res.json(); msg = e.base_resp?.status_msg || e.error?.message || msg; } catch (_) {}
+        try {
+            const e = await res.json();
+            msg = e.base_resp?.status_msg || e.error?.message || e.message || e.detail || msg;
+        } catch (_) {
+            try { msg = await res.text(); } catch (_) {}
+        }
         throw new Error(msg);
     }
 
-    const data = await res.json();
-    if (data.base_resp?.status_code !== 0 && data.base_resp?.status_code !== undefined) {
-        throw new Error(data.base_resp?.status_msg || 'MiniMax API 返回错误');
+    // 有些中转站直接返回音频 blob（Content-Type: audio/*）
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('audio/') || ct.includes('octet-stream')) {
+        return await res.blob();
     }
 
-    const audioData = data.data?.audio || data.audio;
+    // 官方 API 返回 JSON + base64 音频
+    const data = await res.json();
+
+    if (data.base_resp?.status_code !== 0 && data.base_resp?.status_code !== undefined) {
+        throw new Error(data.base_resp?.status_msg || 'API 返回错误');
+    }
+
+    const audioData = data.data?.audio || data.audio || data.audio_data;
     if (!audioData) throw new Error('API 返回无音频数据');
 
     // base64 → Blob
@@ -385,6 +430,7 @@ async function directMinimaxTts(text, options) {
     const mimeMap = { mp3: 'audio/mpeg', wav: 'audio/wav', pcm: 'audio/pcm', flac: 'audio/flac' };
     return new Blob([byteArray], { type: mimeMap[options.audioFormat] || 'audio/mpeg' });
 }
+
 
 // ★ 修复4: getAudioBlob 增加 fallback
 async function getAudioBlob(item) {
@@ -1873,7 +1919,9 @@ function openConfigPanel() {
         <p class="mm-desc">配置 MiniMax TTS API 连接参数及默认音色。</p>
         <div class="mm-row"><label>API Key</label><input id="mm_key" class="text_pole" type="password" autocomplete="off"></div>
         <div class="mm-row"><label>Group ID</label><input id="mm_gid" class="text_pole" type="text"></div>
-        <div class="mm-row"><label>API 节点</label><select id="mm_apihost" class="text_pole">${API_HOST_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
+        <div class="mm-row"><label>API 节点</label><select id="mm_apihost" class="text_pole">${API_HOST_OPTIONS.map(o=>'<option value="'+o.value+'">'+o.label+'</option>').join('')}</select></div>
+<div class="mm-row" id="mm_custom_host_row" style="display:none"><label>中转地址</label><input id="mm_custom_host" class="text_pole" type="text" placeholder="https://tts.aurastd.com/api/v1/tts"></div>
+
         <div class="mm-row"><label>默认模型</label><select id="mm_model" class="text_pole">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
         <div class="mm-row">
           <label>默认语音</label>
@@ -2086,6 +2134,7 @@ function openConfigPanel() {
             s().apiKey  = document.getElementById('mm_key').value;
             s().groupId = document.getElementById('mm_gid').value;
             s().apiHost = document.getElementById('mm_apihost').value;
+            s().customApiHost = document.getElementById('mm_custom_host')?.value || '';
             s().model   = document.getElementById('mm_model').value;
             s().voiceId = voiceSel.value || document.getElementById('mm_voice').value;
             s().speed   = Number(document.getElementById('mm_speed').value);
@@ -2095,12 +2144,22 @@ function openConfigPanel() {
             saveSettingsDebounced();
             syncToSTSecrets((s().apiKey || '').trim(), (s().groupId || '').trim());
         };
+                // 中转站输入框联动
+        document.getElementById('mm_apihost').addEventListener('change', function() {
+            const row = document.getElementById('mm_custom_host_row');
+            if (row) row.style.display = this.value === 'custom' ? '' : 'none';
+        });
+        // 初始化时检查
+        if (s().apiHost === 'custom') {
+            const row = document.getElementById('mm_custom_host_row');
+            if (row) row.style.display = '';
+        }
         document.getElementById('mm_show_bubbles').addEventListener('change', function() {
             s().showBubbles = this.checked;
             saveSettingsDebounced();
             if (this.checked) refreshAllBubbles(); else removeAllBubbles();
         });
-        ['mm_key','mm_gid','mm_apihost','mm_model','mm_voice_sel','mm_voice','mm_speed','mm_vol','mm_tts_lang','mm_autoplay'].forEach(id => {
+         ['mm_key','mm_gid','mm_apihost','mm_custom_host','mm_model','mm_voice_sel','mm_voice','mm_speed','mm_vol','mm_tts_lang','mm_autoplay'].forEach(id => {
             const el = document.getElementById(id);
             if (!el) return; // ★ 防御 null
             el.addEventListener('input', syncTts);
@@ -2484,9 +2543,21 @@ function openConfigPanel() {
         upVcTemplates();
     }
 
-    // ★ 修复7: 每次打开都刷新字段值
+// ★ 修复7: 每次打开都刷新字段值
     populateConfigFields();
     document.getElementById('mm-config-mask').classList.add('mm-config-open');
+}
+
+// 中转站自定义地址显示/隐藏联动
+document.getElementById('mm_apihost').addEventListener('change', function() {
+    const row = document.getElementById('mm_custom_host_row');
+    if (row) row.style.display = this.value === 'custom' ? '' : 'none';
+});
+
+// 初始化时自动显示自定义地址
+if (s().apiHost === 'custom') {
+    const row = document.getElementById('mm_custom_host_row');
+    if (row) row.style.display = '';
 }
 
 jQuery(async () => {
