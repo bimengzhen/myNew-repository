@@ -1,0 +1,12 @@
+{
+  "display_name": "MiniMax语音",
+  "loading_order": 20,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Local",
+  "version": "0.3.0",
+  "description": "MiniMax TTS 语音播放 + 语音通话（悬浮球一键打电话）。",
+  "auto_update": false
+}
