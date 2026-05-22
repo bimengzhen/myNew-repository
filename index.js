@@ -716,12 +716,57 @@ function injectBubbles(mesid) {
     const allItems = h?.versions?.[h.activeIndex]?.items || [];
     const items = allItems.map((it, idx) => ({ it, idx })).filter(({ it }) => !it.pauseMs && it.text);
 
-    const ver = `${key}:${h?.activeIndex}:${items.length}`;
-    const actualBubbles = textEl.querySelectorAll('.mm-bubble').length;
-    if (textEl.dataset.mmBubVer === ver && actualBubbles === items.length) {
+    // 判断是否为「引号提取」模式
+    const isQuoteMode = !s().formatterEnabled && (s().regexRules || []).some(
+        r => r.enabled && r.mode === 'extract'
+    );
+
+    // 版本标记：只基于数据本身，不基于 DOM 中实际匹配数量
+    const ver = `${key}:${h?.activeIndex}:${items.length}:${isQuoteMode ? 'q' : 'f'}`;
+
+    // 版本未变化 → 只刷新缓存状态，不重新注入
+    if (textEl.dataset.mmBubVer === ver) {
         refreshBubbleStates(mesid);
         return;
     }
+
+    // 清除旧气泡
+    textEl.querySelectorAll('.mm-bubble').forEach(el => el.remove());
+    textEl.querySelector('.mm-bubble-strip')?.remove();
+    if (!items.length) { delete textEl.dataset.mmBubVer; return; }
+
+    const unmatched = [];
+
+    items.forEach(({ it: item, idx }) => {
+        const bubble = makeBubble(mesid, idx, item, false);
+
+        if (isQuoteMode) {
+            // 引号模式：在「引号内文本 + 闭合引号」之后注入气泡
+            if (!injectAfterClosingQuote(textEl, item.text, bubble)) {
+                unmatched.push({ item, idx });
+            }
+        } else {
+            // LLM 格式化模式：按裸文本匹配
+            if (!injectAfterText(textEl, item.text, bubble)) {
+                unmatched.push({ item, idx });
+            }
+        }
+    });
+
+    // ★ 核心修复：引号模式下永远不显示底部条
+    // 未匹配的 = 旁白/叙述内容，不应该有气泡
+    // 只有 LLM 格式化模式才显示底部兜底条
+    if (unmatched.length && !isQuoteMode) {
+        const strip = document.createElement('div');
+        strip.className = 'mm-bubble-strip';
+        unmatched.forEach(({ item, idx }) => strip.appendChild(makeBubble(mesid, idx, item, true)));
+        textEl.appendChild(strip);
+    }
+
+    // ★ 核心修复：标记版本，防止 setInterval 每秒重新注入
+    textEl.dataset.mmBubVer = ver;
+}
+
 
     // 清除旧气泡
     textEl.querySelectorAll('.mm-bubble').forEach(el => el.remove());
@@ -2548,17 +2593,6 @@ function openConfigPanel() {
     document.getElementById('mm-config-mask').classList.add('mm-config-open');
 }
 
-// 中转站自定义地址显示/隐藏联动
-document.getElementById('mm_apihost').addEventListener('change', function() {
-    const row = document.getElementById('mm_custom_host_row');
-    if (row) row.style.display = this.value === 'custom' ? '' : 'none';
-});
-
-// 初始化时自动显示自定义地址
-if (s().apiHost === 'custom') {
-    const row = document.getElementById('mm_custom_host_row');
-    if (row) row.style.display = '';
-}
 
 jQuery(async () => {
     loadSettings(); createUi();
