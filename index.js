@@ -14,10 +14,10 @@ const API_HOST_OPTIONS = [
 const TARGET_TYPE = { CURRENT_CHARACTER: 'current_character', CURRENT_USER: 'current_user', CUSTOM: 'custom' };
 const API_FORMATS = { OAI: 'openai', GOOGLE: 'google' };
 const MODEL_OPTIONS = [
-    { value: 'Speech-2.8-turbo', label: 'Speech-2.8-turbo(最新极速)' },
-    { value: 'Speech-2.8-hd', label: 'Speech-2.8-hd(最新高清)' },
-    { value: 'Speech-2.6-turbo', label: 'Speech-2.6-turbo' },
-    { value: 'Speech-2.6-hd', label: 'Speech-2.6-hd' },
+    { value: 'speech-2.8-turbo', label: 'speech-2.8-turbo(最新极速)' },
+    { value: 'speech-2.8-hd', label: 'speech-2.8-hd(最新高清)' },
+    { value: 'speech-2.6-turbo', label: 'speech-2.6-turbo' },
+    { value: 'speech-2.6-hd', label: 'speech-2.6-hd' },
     { value: 'minimax-speech-2.5-turbo', label: 'minimax-speech-2.5-turbo' },
     { value: 'minimax-speech-2.5-hd', label: 'minimax-speech-2.5-hd' },
     { value: 'speech-02-hd', label: 'speech-02-hd(旧版)' },
@@ -30,7 +30,7 @@ const MODEL_OPTIONS = [
 const defaults = {
     enabled: true, autoPlay: true, showMessageButton: true, onlyCharacter: true,
     apiKey: '', groupId: '', apiHost: DEFAULT_API_HOST, customApiHost: '',
-    model: 'Speech-2.8-hd', voiceId: 'English_expressive_narrator',
+    model: 'speech-2.8-hd', voiceId: 'English_expressive_narrator',
     speed: 1, vol: 1, pitch: 0, emotion: '', audioFormat: 'mp3', ttsLanguage: '',
     maxQuotesPerMessage: 4, minLength: 1, maxLength: 300, ignoreCodeBlocks: true,
     characterBindingsMap: {}, llmPresets: [], formatterTemplates: [],
@@ -38,6 +38,11 @@ const defaults = {
     formatterSystemPrompt: '请以严格的JSON格式返回：{"segments":[{"text":"...","speaker":"...","emotion":"...","speed":1.0,"vol":1.0,"pitch":0}]}.仅保留可朗读的内容。',
     serverHistory: {}, voiceLibrary: [], regexRules: [], regexPresets: [],
     llmPreProcessRules: [], showBubbles: false,
+    defaultMaleVoiceId: '', defaultFemaleVoiceId: '',
+    defaultMaleModel: '', defaultFemaleModel: '',
+    autoClearInterval: 4, _messageCounter: 0,
+    showFloatingBtn: true, floatingBtnImg: '',
+    floatingBtnX: null, floatingBtnY: null,
 };
 
 let playbackQueue = [], isPlaying = false, clickTimer = null;
@@ -45,7 +50,25 @@ let activeAudio = new Audio();
 const localAudioCache = new Map();
 
 function s() { return extension_settings[MODULE_NAME]; }
+window._mmtts = function() { return extension_settings[MODULE_NAME]; };
+
 function escHtml(v) { return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+var ttsLogs = [];
+function ttsLog(msg, type) {
+    var t = new Date().toLocaleTimeString();
+    var line = '[' + t + '] ' + msg;
+    console.log('[MiniMax TTS] ' + msg);
+    ttsLogs.push({ t: t, msg: msg, type: type || 'info' });
+    if (ttsLogs.length > 200) ttsLogs.shift();
+    var el = document.getElementById('mm_log_box');
+    if (el) {
+        var color = type === 'error' ? '#ef5350' : type === 'success' ? '#4caf50' : type === 'warn' ? '#ff9800' : '#aaa';
+        el.innerHTML += '<div style="color:' + color + ';margin:2px 0;font-size:0.78rem;word-break:break-all">' + escHtml(line) + '</div>';
+        el.scrollTop = el.scrollHeight;
+    }
+}
+
 function parsePattern(str) { const p = (str || '').trim(); if (p.startsWith('/')) { const last = p.lastIndexOf('/'); if (last > 0) return p.slice(1, last); } return p; }
 function isHtmlMessage(mes) { return /class="|<div[\s>]|<table|<details|<summary|style="/i.test(mes || ''); }
 function simpleHash(t) { if (!t) return 0; let h = 0; for (let i = 0; i < t.length; i++) h = ((h << 5) - h) + t.charCodeAt(i), h |= 0; return Math.abs(h); }
@@ -121,26 +144,37 @@ function getAudioFieldFromResponse(d) {
 }
 
 async function extractAudioFromResponse(d, fmt) {
-    const u = d.data?.audio_url || d.audio_url || d.data?.url || d.url
-        || d.data?.audio_file || d.audio_file || d.data?.file_url || d.file_url;
-    if (u && typeof u === 'string' && (u.startsWith('http') || u.startsWith('//'))) {
-        const r = await fetch(u.startsWith('//') ? 'https:' + u : u);
-        if (!r.ok) throw new Error('音频下载失败:HTTP' + r.status);
-        return await r.blob();
+    var urlFields = [
+        d.data?.audio_url, d.audio_url,
+        d.data?.url, d.url,
+        d.data?.audio_file, d.audio_file,
+        d.data?.file_url, d.file_url,
+        d.data?.audio, d.audio,
+    ];
+    for (var i = 0; i < urlFields.length; i++) {
+        var u = urlFields[i];
+        if (u && typeof u === 'string' && (u.startsWith('http') || u.startsWith('//'))) {
+            var fullUrl = u.startsWith('//') ? 'https:' + u : u;
+            console.log('[MiniMax TTS] 音频URL:', fullUrl.slice(0, 80));
+            // 不fetch，直接返回URL标记，让Audio标签直接播放
+            return { _audioUrl: fullUrl };
+        }
     }
-    const a = d.data?.audio || d.audio || d.audio_data || d.data?.audio_data;
-    if (a && typeof a === 'string') {
-        const bc = atob(a), ba = new Uint8Array(bc.length);
-        for (let i = 0; i < bc.length; i++) ba[i] = bc.charCodeAt(i);
-        const mm = { mp3: 'audio/mpeg', wav: 'audio/wav', pcm: 'audio/pcm', flac: 'audio/flac' };
+    var a = d.data?.audio || d.audio || d.audio_data || d.data?.audio_data;
+    if (a && typeof a === 'string' && !a.startsWith('http')) {
+        var bc = atob(a), ba = new Uint8Array(bc.length);
+        for (var j = 0; j < bc.length; j++) ba[j] = bc.charCodeAt(j);
+        var mm = { mp3: 'audio/mpeg', wav: 'audio/wav', pcm: 'audio/pcm', flac: 'audio/flac' };
         return new Blob([ba], { type: mm[fmt] || 'audio/mpeg' });
     }
-    const h = d.data?.audio_hex || d.audio_hex;
+    var h = d.data?.audio_hex || d.audio_hex;
     if (h && typeof h === 'string') {
-        return new Blob([new Uint8Array(h.match(/.{1,2}/g).map(b => parseInt(b, 16)))], { type: 'audio/mpeg' });
+        return new Blob([new Uint8Array(h.match(/.{1,2}/g).map(function (b) { return parseInt(b, 16); }))], { type: 'audio/mpeg' });
     }
     throw new Error('API返回格式无法识别');
 }
+
+
 
 async function pollTaskResult(baseUrl, headers, taskId) {
     const MAX = 60, INT = 2000;
@@ -195,15 +229,20 @@ async function directMinimaxTts(text, options) {
     const fmt = options.audioFormat || set.audioFormat || 'mp3';
     const model = options.model || set.model;
 
-    const body = {
+    var body = {
         model: model,
         text: text,
         stream: false,
+        language_boost: lang ||'auto',
+        output_format: 'url',
         voice_setting: {
             voice_id: voiceId,
             speed: speed,
             vol: vol,
-            pitch: pitch,
+            pitch: pitch,emotion: emotion || 'neutral',
+        },
+        pronunciation_dict: {
+            tone: [],
         },
         audio_setting: {
             sample_rate: 32000,
@@ -211,10 +250,13 @@ async function directMinimaxTts(text, options) {
             format: fmt,
             channel: 1,
         },
+        voice_modify: {
+            pitch: 0,
+            intensity: 0,
+            timbre: 0,
+            sound_effects: '',
+        },
     };
-
-    if (emotion) body.voice_setting.emotion = emotion;
-    if (lang) body.language_boost = lang;
 
     console.log('[MiniMax TTS] ===== 请求开始 =====');
     console.log('[MiniMax TTS] URL:', url);
@@ -299,6 +341,7 @@ async function getAudioBlob(item) {
         console.warn('[MiniMax] 代理失败,直连:', pe.message);
         blob = await directMinimaxTts(item.text, item.options);
     }
+    if (blob && blob._audioUrl) return blob; // URL类型不缓存blob
     localAudioCache.set(ck, blob);
     uploadToSTServer(blob, ck + '.' + item.options.audioFormat).then(p => {
         if (p) { item.serverPath = p; saveSettingsDebounced(); }
@@ -309,78 +352,207 @@ async function getAudioBlob(item) {
 async function playNext() {
     if (!playbackQueue.length) { isPlaying = false; return; }
     isPlaying = true;
-    const item = playbackQueue.shift();
-    if (item.pauseMs) { await new Promise(r => setTimeout(r, item.pauseMs)); playNext(); return; }
+    var item = playbackQueue.shift();
+    if (item.pauseMs) { await new Promise(function (r) { setTimeout(r, item.pauseMs); }); playNext(); return; }
     try {
-        const b = await getAudioBlob(item);
-        const u = URL.createObjectURL(b);
-        activeAudio.src = u;
-        activeAudio.onended = function () { URL.revokeObjectURL(u); playNext(); };
-        activeAudio.onerror = function () { URL.revokeObjectURL(u); playNext(); };
-        await activeAudio.play();
+        var result = await getAudioBlob(item);
+        if (result && result._audioUrl) {
+            // 直接用URL播放，绕过CORS
+            activeAudio.src = result._audioUrl;
+            activeAudio.onended = function () { playNext(); };
+            activeAudio.onerror = function () { playNext(); };
+            await activeAudio.play();
+        } else {
+            var u = URL.createObjectURL(result);
+            activeAudio.src = u;
+            activeAudio.onended = function () { URL.revokeObjectURL(u); playNext(); };
+            activeAudio.onerror = function () { URL.revokeObjectURL(u); playNext(); };
+            await activeAudio.play();
+        }
     } catch (e) { console.error('[MiniMax TTS]', e); playNext(); }
 }
 
+
 function applyPreProcessRules(text) {
-    const rules = (s().llmPreProcessRules || []).filter(function (r) { return r.enabled && r.pattern; });
-    if (!rules.length) return text;
+    var allRules = s().llmPreProcessRules || [];
+    var rules = allRules.filter(function (r) { return r.enabled && r.pattern; });
+    ttsLog('预处理: 总规则=' + allRules.length + ' 启用=' + rules.length);
+    if (!rules.length) {
+        ttsLog('无启用规则，跳过预处理', 'warn');
+        return text;
+    }
     for (var ri = 0; ri < rules.length; ri++) {
         var rule = rules[ri];
+        var patternStr = parsePattern(rule.pattern);
+        ttsLog('  规则#' + (ri + 1) + ' [' + (rule.name || '?') + '] 模式=' + rule.mode + ' 正则=' + patternStr);
         var re;
-        try { re = new RegExp(parsePattern(rule.pattern), 'gs'); } catch (_) { continue; }
+        try {
+            re = new RegExp(patternStr, 'gs');
+        } catch (e) {
+            ttsLog('  ❌ 正则编译失败: ' + e.message, 'error');
+            continue;
+        }
         if (rule.mode === 'extract') {
             var matches = [], x;
-            while ((x = re.exec(text)) !== null) { var t = (x[1] !== undefined ? x[1] : x[0]).trim(); if (t) matches.push(t); }
-            if (matches.length) text = matches.join('\n');
-        } else { text = text.replace(re, ''); }
+            while ((x = re.exec(text)) !== null) {
+                var t = (x[1] !== undefined ? x[1] : x[0]).trim();
+                if (t) matches.push(t);
+            }
+            ttsLog('  提取匹配数: ' + matches.length + (matches.length ? ' ✓' : ' ✗'), matches.length ? 'success' : 'warn');
+            if (matches.length) {
+                text = matches.join('\n');
+                ttsLog('  提取后长度: ' + text.length + '字');
+            }
+        } else {
+            var before = text.length;
+            text = text.replace(re, '');
+            ttsLog('  排除: ' + before + '字 → ' + text.length + '字 (删' + (before - text.length) + '字)');
+        }
     }
+    ttsLog('预处理完成, 最终长度: ' + text.length + '字');
     return text.trim();
 }
 
+
 async function formatWithSecondaryApi(m) {
+    ttsLog('=== 副LLM分析开始 ===');
     var set = s(), preset = (set.llmPresets || [])[set.formatterPresetIdx];
-    if (!preset) throw new Error('请先选择LLM预设');
-    var fmt = preset.format || API_FORMATS.OAI, prompt = set.formatterSystemPrompt;
-    var text;
-    if (fmt === API_FORMATS.OAI) {
-        var d = await proxyFetch(normalizeOaiUrl(preset.url), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (preset.key || '').trim() },
-            body: { model: preset.model, messages: [{ role: 'system', content: prompt }, { role: 'user', content: applyPreProcessRules(m.mes) }], temperature: 0.1 },
-        });
-        text = d.choices && d.choices[0] && d.choices[0].message ? d.choices[0].message.content : '';
-    } else {
-        var bu = (preset.url || '').trim().replace(/\/+$/, '');
-        var d2 = await proxyFetch(bu + '/v1beta/models/' + preset.model + ':generateContent', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': (preset.key || '').trim() },
-            body: { contents: [{ role: 'user', parts: [{ text: 'System Prompt: ' + prompt + '\n\nUser Message: ' + applyPreProcessRules(m.mes) }] }] },
-        });
-        text = d2.candidates && d2.candidates[0] ? d2.candidates[0].content.parts[0].text : '';
+    if (!preset) {
+        ttsLog('错误: 未选择LLM预设 idx=' + set.formatterPresetIdx + ' 总数=' + (set.llmPresets || []).length, 'error');
+        throw new Error('请先选择LLM预设');
     }
-    var match = text.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error('AI无有效JSON');
-    return JSON.parse(match[0]).segments || null;
+    ttsLog('预设: ' + preset.name + ' 模型: ' + preset.model + ' 格式: ' + (preset.format || API_FORMATS.OAI));
+    ttsLog('消息长度: ' + (m.mes || '').length + '字');
+
+    var fmt = preset.format || API_FORMATS.OAI, prompt = set.formatterSystemPrompt;
+    var inputText = applyPreProcessRules(m.mes);
+    ttsLog('预处理后: ' + inputText.slice(0, 100) + (inputText.length > 100 ? '...' : ''));
+
+    var text = '';
+    try {
+        if (fmt === API_FORMATS.OAI) {
+            var reqUrl = normalizeOaiUrl(preset.url);
+            ttsLog('请求URL: ' + reqUrl);
+            var d = await proxyFetch(reqUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (preset.key || '').trim() },
+                body: { model: preset.model, messages: [{ role: 'system', content: prompt }, { role: 'user', content: inputText }], temperature: 0.1 },
+            });
+
+            ttsLog('API完整响应: ' + JSON.stringify(d).slice(0, 500));            
+            text = d.choices && d.choices[0] && d.choices[0].message ? d.choices[0].message.content : '';
+        } else {
+            var bu = (preset.url || '').trim().replace(/\/+$/, '');
+            var reqUrl2 = bu + '/v1beta/models/' + preset.model + ':generateContent';
+            ttsLog('请求URL: ' + reqUrl2);
+            var d2 = await proxyFetch(reqUrl2, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': (preset.key || '').trim() },
+                body: { contents: [{ role: 'user', parts: [{ text: 'System Prompt: ' + prompt + '\n\nUser Message: ' + inputText }] }] },
+            });
+
+            ttsLog('API完整响应: ' + JSON.stringify(d2).slice(0, 500));
+            text = d2.candidates && d2.candidates[0] ? d2.candidates[0].content.parts[0].text : '';
+        }
+    } catch (e) {
+        ttsLog('LLM请求失败: ' + e.message, 'error');
+        throw e;
+    }
+
+    ttsLog('LLM原始返回: ' + text.slice(0, 500), text ? 'info' : 'warn');
+
+    if (!text) {
+        ttsLog('LLM返回空内容', 'error');
+        throw new Error('LLM返回空内容');
+    }
+
+    // 清理markdown代码块
+    var cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+    ttsLog('清理后: ' + cleaned.slice(0, 300));
+
+    var match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) {
+        ttsLog('无法提取JSON: ' + cleaned.slice(0, 200), 'error');
+        throw new Error('AI返回无有效JSON');
+    }
+
+    try {
+        var parsed = JSON.parse(match[0]);
+        var segments = parsed.segments || [];
+        ttsLog('解析成功! ' + segments.length + '个片段', 'success');
+        for (var si = 0; si < segments.length; si++) {
+            ttsLog('  #' + (si + 1) + ' [' + (segments[si].speaker || '?') + '] ' + (segments[si].text || '').slice(0, 30) + ' emotion=' + (segments[si].emotion || 'none'), 'success');
+        }
+        return segments;
+    } catch (e) {
+        ttsLog('JSON解析失败: ' + e.message + ' 原文: ' + match[0].slice(0, 200), 'error');
+        throw new Error('JSON解析失败: ' + e.message);
+    }
 }
+
 
 function findCharacterBinding(name) {
     if (!name) return null;
-    var set = s(), ctx = getContext(), n = name.toLowerCase();
-    var id = ctx.characterId || ctx.character_id || ctx.name2|| 'global';
-    var bindings = set.characterBindingsMap[id] || [];
-    for (var i = 0; i < bindings.length; i++) {
-        var b = bindings[i];
-        var bn = (b.targetType === TARGET_TYPE.CUSTOM ? b.customName : (b.targetType === TARGET_TYPE.CURRENT_CHARACTER ? ctx.name2 : ctx.name1));
-        if (bn && bn.toLowerCase() === n) return b;
+    var set = s(), ctx = getContext(), n = name.toLowerCase().trim();
+
+    // 搜索所有绑定（不限当前角色卡）
+    var allBindings = [];
+    for (var cid in set.characterBindingsMap) {
+        var arr = set.characterBindingsMap[cid];
+        if (!arr) continue;
+        for (var i = 0; i < arr.length; i++) allBindings.push(arr[i]);
+    }
+
+    for (var i = 0; i < allBindings.length; i++) {
+        var b = allBindings[i];
+        var bn = '';
+        if (b.targetType === TARGET_TYPE.CUSTOM) bn = b.customName || '';
+        else if (b.targetType === TARGET_TYPE.CURRENT_CHARACTER) bn = ctx.name2 || '';
+        else bn = ctx.name1 || '';
+
+        // 精确匹配主名
+        if (bn && bn.toLowerCase().trim() === n) return b;
+
+        // 别名模糊匹配
+        if (b.aliases) {
+            var aliasList = b.aliases.split(',');
+            for (var j = 0; j < aliasList.length; j++) {
+                var alias = aliasList[j].trim().toLowerCase();
+                if (!alias) continue;
+                if (alias === n || n.indexOf(alias) >= 0 || alias.indexOf(n) >= 0) return b;
+            }
+        }
     }
     return null;
 }
 
+
 function buildSynthesisOptions(seg, m) {
-    var set = s(), b = findCharacterBinding(seg ? seg.speaker : (m ? m.name : ''));
+    var set = s();
+    var speakerName = seg ? seg.speaker : (m ? m.name : '');
+    var b = findCharacterBinding(speakerName);
+
+    var voiceId = set.voiceId, model = set.model;
+
+    if (b) {
+        voiceId = b.voiceId || voiceId;
+        model = b.model || model;
+    } else {
+        var gender = (seg && seg.gender) ? seg.gender.toLowerCase() : '';
+        if (gender === 'male' && set.defaultMaleVoiceId) {
+            voiceId = set.defaultMaleVoiceId;
+            model = set.defaultMaleModel || model;
+        } else if (gender === 'female' && set.defaultFemaleVoiceId) {
+            voiceId = set.defaultFemaleVoiceId;
+            model = set.defaultFemaleModel || model;
+        }
+    }
+
+    if (seg && seg.voiceId) voiceId = seg.voiceId;
+    if (seg && seg.model) model = seg.model;
+
     return {
-        model: (seg && seg.model) || (b && b.model) || set.model,
-        voiceId: (seg && seg.voiceId) || (b && b.voiceId) || set.voiceId,
+        model: model, voiceId: voiceId,
         speed: Number((seg && seg.speed != null) ? seg.speed : set.speed),
         vol: Number((seg && seg.vol != null) ? seg.vol : (set.vol != null ? set.vol : 1)),
         pitch: Number((seg && seg.pitch != null) ? seg.pitch : (set.pitch != null ? set.pitch : 0)),
@@ -389,6 +561,7 @@ function buildSynthesisOptions(seg, m) {
         language: set.ttsLanguage || undefined,
     };
 }
+
 
 function runRegexExtraction(cleanText, rules, speaker) {
     var extracted = [];
@@ -423,17 +596,44 @@ async function generateMessageSpeech(id, forced) {
     var message = data.message, key = data.key;
     if (!message || (s().onlyCharacter && message.is_user)) return false;
     if (isHtmlMessage(message.mes)) return false;
+
+    console.log('[MiniMax TTS] === 生成语音 === id=' + id + ' forced=' + forced + ' formatterEnabled=' + s().formatterEnabled + ' enabled=' + s().enabled);
+
     var h = s().serverHistory[key];
-    if (!forced && h && h.versions && h.versions.length) return true;
+
+    // 格式化器开启时，自动清除旧的正则数据
+    if (s().formatterEnabled && !forced && h && h.versions && h.versions.length) {
+        var v = h.versions[h.activeIndex];
+        if (v && !v._fromFormatter) {
+            console.log('[MiniMax TTS] 检测到旧正则数据，清除重新分析');
+            delete s().serverHistory[key];
+            h = null;
+        }
+    }
+
+    if (!forced && h && h.versions && h.versions.length) {
+        console.log('[MiniMax TTS] 已有缓存，跳过');
+        return true;
+    }
+
     try {
         var raw;
         if (s().formatterEnabled) {
+            console.log('[MiniMax TTS] 调用副LLM分析...');
+            console.log('[MiniMax TTS] presetIdx=' + s().formatterPresetIdx + ' presets数量=' + (s().llmPresets || []).length);
             raw = await formatWithSecondaryApi(message);
+            console.log('[MiniMax TTS] LLM返回:', JSON.stringify(raw).slice(0, 500));
         } else {
             var ct = s().ignoreCodeBlocks ? message.mes.replace(/```[\s\S]*?```/g, ' ') : message.mes;
             var rules = (s().regexRules || []).filter(function (r) { return r.enabled; });
             raw = rules.length ? runRegexExtraction(ct, rules, message.name) : [];
         }
+
+        if (!raw || !raw.length) {
+            console.warn('[MiniMax TTS] 未找到可朗读内容');
+            return false;
+        }
+
         var items = raw.map(function (seg) {
             return {
                 text: seg.text,
@@ -443,15 +643,62 @@ async function generateMessageSpeech(id, forced) {
                 serverPath: null,
             };
         });
+        if (s().formatterEnabled && message.mes) {
+            var origText = message.mes;
+            for (var qi = 0; qi < items.length; qi++) {
+                if (items[qi].fullMatch) continue;
+                var segText = items[qi].text;
+                var matched = false;
+
+                // 1. 尝试各种包裹符号
+                var wraps = [['\u201c','\u201d'],['\u300c','\u300d'],['\u300e','\u300f'],['\u2018','\u2019'],['"','"'],["'","'"],['(',')'],['（','）'],['「','」'],['『','』']];
+                for (var qc = 0; qc < wraps.length; qc++) {
+                    var tryMatch = wraps[qc][0] + segText + wraps[qc][1];
+                    if (origText.indexOf(tryMatch) >= 0) {
+                        items[qi].fullMatch = tryMatch;
+                        matched = true;
+                        break;
+                    }
+                }
+
+                // 2. 直接搜索原文
+                if (!matched && origText.indexOf(segText) >= 0) {
+                    items[qi].fullMatch = segText;
+                    matched = true;
+                }
+
+                // 3. 去掉首尾标点再试
+                if (!matched) {
+                    var trimmed = segText.replace(/^[（(「『"'"'\s]+/, '').replace(/[）)」』"'"'\s]+$/, '');
+                    if (trimmed && trimmed !== segText && origText.indexOf(trimmed) >= 0) {
+                        items[qi].fullMatch = trimmed;
+                        matched = true;
+                    }
+                }
+
+                console.log('[MiniMax TTS] 匹配#' + qi + ' [' + (matched ? '✓' : '✗') + '] "' + segText.slice(0, 25) + '" → fullMatch=' + (items[qi].fullMatch || '').slice(0, 30));
+            }
+        }
+
+
+        console.log('[MiniMax TTS] 生成 ' + items.length + ' 个片段:', items.map(function(it) { return it.speaker + ':' + it.text.slice(0, 20); }));
+
         if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
-        s().serverHistory[key].versions.push({ items: items, timestamp: Date.now() });
+        var newVer = { items: items, timestamp: Date.now() };
+        if (s().formatterEnabled) newVer._fromFormatter = true;
+        s().serverHistory[key].versions.push(newVer);
         s().serverHistory[key].activeIndex = s().serverHistory[key].versions.length - 1;
         saveSettingsDebounced();
         refreshAllMessageButtons();
         injectBubbles(id);
         return true;
-    } catch (e) { toastr.error('生成失败:' + e.message); return false; }
+    } catch (e) {
+        console.error('[MiniMax TTS] 生成失败:', e);
+        toastr.error('生成失败: ' + e.message);
+        return false;
+    }
 }
+
 
 function extractSegmentsOnly(id) {
     if (!s().showBubbles) return false;
@@ -584,22 +831,15 @@ function injectBubbles(mesid) {
     var textEl = mesEl.querySelector('.mes_text');
     if (!textEl) return;
 
-    //先清理旧气泡
     textEl.querySelectorAll('.mm-bubble').forEach(function (e) { e.remove(); });
     var oldStrip = textEl.querySelector('.mm-bubble-strip');
     if (oldStrip) oldStrip.remove();
     delete textEl.dataset.mmBubVer;
 
-    // HTML消息跳过
     if (isHtmlMessage(message.mes)) {
-        if (s().serverHistory[key]) {
-            delete s().serverHistory[key];
-            saveSettingsDebounced();
-        }
+        if (s().serverHistory[key]) { delete s().serverHistory[key]; saveSettingsDebounced(); }
         return;
     }
-
-    if (s().formatterEnabled) return;
 
     var h = s().serverHistory[key];
     var allItems = (h && h.versions && h.versions[h.activeIndex]) ? h.versions[h.activeIndex].items : [];
@@ -611,29 +851,45 @@ function injectBubbles(mesid) {
     }
     if (!items.length) return;
 
-    //旧数据没fullMatch就清掉
-    var hasOld = false;
-    for (var j = 0; j < items.length; j++) {
-        if (!items[j].it.fullMatch) { hasOld = true; break; }
-    }
-    if (hasOld) {
-        delete s().serverHistory[key];
-        saveSettingsDebounced();return;
+    var hasInline = items.some(function(x) { return !!x.it.fullMatch; });
+    var useStrip = !hasInline;
+
+    var inlineItems = [], stripItems = [];
+    for (var si = 0; si < items.length; si++) {
+        if (items[si].it.fullMatch) inlineItems.push(items[si]);
+        else stripItems.push(items[si]);
     }
 
-    var isQuoteMode = (s().regexRules || []).some(function (r) { return r.enabled && r.mode === 'extract'; });
-    if (!isQuoteMode) return;
-
-    // 只在引号后面插入气泡
-    for (var k = 0; k < items.length; k++) {
-        var item = items[k].it;
-        if (!item.fullMatch) continue;
-        var bubble = makeBubble(mesid, items[k].idx, item, false);
-        injectAfterText(textEl, item.fullMatch, bubble);
+    for (var mi = 0; mi < inlineItems.length; mi++) {
+        var inItem = inlineItems[mi].it;
+        var inBub = makeBubble(mesid, inlineItems[mi].idx, inItem, false);
+        injectAfterText(textEl, inItem.fullMatch, inBub);
     }
+
+    if (stripItems.length && !inlineItems.length) {
+        var strip = document.createElement('div');
+        strip.className = 'mm-bubble-strip';
+        for (var sk = 0; sk < stripItems.length; sk++) {
+            var sItem = stripItems[sk].it;
+            var sBub = document.createElement('span');
+            sBub.className = 'mm-bubble';
+            sBub.dataset.mesid = mesid;
+            sBub.dataset.segidx = stripItems[sk].idx;
+            sBub.title = (sItem.speaker ? sItem.speaker +': ' : '') + sItem.text;
+            var sLabel = sItem.text.length > 20 ? sItem.text.slice(0, 20) + '' : sItem.text;
+            sBub.innerHTML = '<i class="fa-solid fa-volume-low"></i>'
+                + (sItem.speaker ? '<b style="opacity:.7;margin-right:3px">' + escHtml(sItem.speaker) + ':</b>' : '')
+                + escHtml(sLabel);
+            if (isBubbleCached(sItem))sBub.classList.add('mm-bubble-cached');
+            strip.appendChild(sBub);
+        }
+        textEl.appendChild(strip);
+    }
+
 
     textEl.dataset.mmBubVer = key + ':' + (h ? h.activeIndex : 0) + ':' + items.length;
 }
+
 
 function refreshAllBubbles() {
     removeAllBubbles();
@@ -735,7 +991,96 @@ function injectStyles() {
     if (document.getElementById('mm-tts-css')) return;
     var st = document.createElement('style');
     st.id = 'mm-tts-css';
-    st.textContent = '.mm-config-mask{display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);justify-content:center;align-items:center;padding:16px}.mm-config-mask.mm-config-open{display:flex!important}.mm-config-dialog{width:min(680px,96vw);max-height:92vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}.mm-config-header{display:flex;align-items:center;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.08);flex-shrink:0;gap:8px}.mm-config-close{background:none;border:none;color:inherit;font-size:1.2rem;cursor:pointer;padding:4px 8px;opacity:.6;flex-shrink:0}.mm-config-close:hover{opacity:1}.mm-config-body{flex:1;overflow-y:auto;padding:16px}.mm-tab-bar{display:flex;gap:2px;flex:1;flex-wrap:wrap}.mm-tab{background:transparent;border:none;color:inherit;padding:6px 14px;cursor:pointer;border-radius:8px 8px 0 0;font-size:.88rem;opacity:.55;white-space:nowrap}.mm-tab:hover{opacity:.8;background:rgba(255,255,255,.04)}.mm-tab.active{opacity:1;background:rgba(255,255,255,.08);font-weight:600}.mm-tab-panel{display:none}.mm-tab-panel.active{display:block}.mm-config-dialog .mm-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}.mm-config-dialog .mm-row>label{min-width:85px;flex-shrink:0;font-size:.88rem;opacity:.8}.mm-config-dialog .text_pole{flex:1;min-width:0;max-width:100%;box-sizing:border-box;height:34px!important;font-size:.88rem!important}.mm-config-dialog textarea.text_pole{height:auto!important;min-height:64px;resize:vertical}.mm-config-dialog select.text_pole{flex:1;min-width:0}.mm-config-dialog input[type=checkbox]{flex:none;width:18px;height:18px}.mm-section-title{font-weight:600;font-size:.95rem;margin:16px 0 8px;display:flex;align-items:center;gap:10px}.mm-desc{font-size:.82rem;opacity:.55;margin:0 0 10px;line-height:1.4}.mm-inline-hint{font-size:.78rem;opacity:.5;white-space:nowrap}.mm-voice-lib-row,.mm-binding-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}.mm-binding-row{flex-wrap:wrap}.mm-binding-row .text_pole{flex:1;min-width:80px}.mm-rule-header-row{display:flex;gap:6px;font-size:.78rem;opacity:.5;padding:0 0 4px}.mm-rule-header-row>span{flex:1}.mm-rule-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}.mm-rule-row .text_pole{flex:1;min-width:0}.mes_quote_tts{cursor:pointer;opacity:.5}.mes_quote_tts:hover{opacity:.85}.mes_quote_tts.ready{opacity:1;color:#4caf50}.mm-bubble{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;margin:0 2px;border-radius:10px;background:rgba(110,160,255,.12);cursor:pointer;font-size:.78rem;vertical-align:middle;transition:background .15s;white-space:nowrap}.mm-bubble:hover{background:rgba(110,160,255,.25)}.mm-bubble i{font-size:.7rem}.mm-bubble-cached{background:rgba(76,175,80,.15)}.mm-bubble-cached:hover{background:rgba(76,175,80,.3)}.mm-bubble-loading{opacity:.5;pointer-events:none}.mm-bubble-playing{background:rgba(255,165,0,.2)}.mm-bubble-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-top:6px;border-top:1px dashed rgba(255,255,255,.1)}.minimax-tts-editor-mask{position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.6);display:flex;justify-content:center;align-items:center;padding:16px}.minimax-tts-editor-dialog{width:min(600px,94vw);max-height:88vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;display:flex;flex-direction:column;overflow:hidden}.minimax-tts-editor-header{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.08);gap:8px}.minimax-tts-editor-body{flex:1;overflow-y:auto;padding:16px}.minimax-tts-editor-item{margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid rgba(255,255,255,.05)}.minimax-tts-editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.minimax-tts-editor-row-flex{display:flex;align-items:center;gap:6px}.minimax-tts-editor-row-flex label{min-width:36px;font-size:.82rem;opacity:.7}.minimax-tts-editor-actions{display:flex;gap:10px;padding:12px 16px;border-top:1px solid rgba(255,255,255,.08)}.minimax-tts-editor-actions .menu_button{flex:1}';
+    st.textContent = '.mm-config-mask{display:none;position:fixed;inset:0;z-index:2147483001!important;;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);justify-content:center;align-items:center;padding:16px}.mm-config-mask.mm-config-open{display:flex!important}.mm-config-dialog{width:min(680px,96vw);max-height:92vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}.mm-config-header{display:flex;align-items:center;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.08);flex-shrink:0;gap:8px}.mm-config-close{background:none;border:none;color:inherit;font-size:1.2rem;cursor:pointer;padding:4px 8px;opacity:.6;flex-shrink:0}.mm-config-close:hover{opacity:1}.mm-config-body{flex:1;overflow-y:auto;padding:16px}.mm-tab-bar{display:flex;gap:2px;flex:1;flex-wrap:wrap}.mm-tab{background:transparent;border:none;color:inherit;padding:6px 14px;cursor:pointer;border-radius:8px 8px 0 0;font-size:.88rem;opacity:.55;white-space:nowrap}.mm-tab:hover{opacity:.8;background:rgba(255,255,255,.04)}.mm-tab.active{opacity:1;background:rgba(255,255,255,.08);font-weight:600}.mm-tab-panel{display:none}.mm-tab-panel.active{display:block}.mm-config-dialog .mm-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}.mm-config-dialog .mm-row>label{min-width:85px;flex-shrink:0;font-size:.88rem;opacity:.8}.mm-config-dialog .text_pole{flex:1;min-width:0;max-width:100%;box-sizing:border-box;height:34px!important;font-size:.88rem!important}.mm-config-dialog textarea.text_pole{height:auto!important;min-height:64px;resize:vertical}.mm-config-dialog select.text_pole{flex:1;min-width:0}.mm-config-dialog input[type=checkbox]{flex:none;width:18px;height:18px}.mm-section-title{font-weight:600;font-size:.95rem;margin:16px 0 8px;display:flex;align-items:center;gap:10px}.mm-desc{font-size:.82rem;opacity:.55;margin:0 0 10px;line-height:1.4}.mm-inline-hint{font-size:.78rem;opacity:.5;white-space:nowrap}.mm-voice-lib-row,.mm-binding-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}.mm-binding-row{flex-wrap:wrap}.mm-binding-row .text_pole{flex:1;min-width:80px}.mm-rule-header-row{display:flex;gap:6px;font-size:.78rem;opacity:.5;padding:0 0 4px}.mm-rule-header-row>span{flex:1}.mm-rule-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}.mm-rule-row .text_pole{flex:1;min-width:0}.mes_quote_tts{cursor:pointer;opacity:.5}.mes_quote_tts:hover{opacity:.85}.mes_quote_tts.ready{opacity:1;color:#4caf50}.mm-bubble{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;margin:0 2px;border-radius:10px;background:rgba(110,160,255,.12);cursor:pointer;font-size:.78rem;vertical-align:middle;transition:background .15s;white-space:nowrap}.mm-bubble:hover{background:rgba(110,160,255,.25)}.mm-bubble i{font-size:.7rem}.mm-bubble-cached{background:rgba(76,175,80,.15)}.mm-bubble-cached:hover{background:rgba(76,175,80,.3)}.mm-bubble-loading{opacity:.5;pointer-events:none}.mm-bubble-playing{background:rgba(255,165,0,.2)}.mm-bubble-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-top:6px;border-top:1px dashed rgba(255,255,255,.1)}.minimax-tts-editor-mask{position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.6);display:flex;justify-content:center;align-items:center;padding:16px}.minimax-tts-editor-dialog{width:min(600px,94vw);max-height:88vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;display:flex;flex-direction:column;overflow:hidden}.minimax-tts-editor-header{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.08);gap:8px}.minimax-tts-editor-body{flex:1;overflow-y:auto;padding:16px}.minimax-tts-editor-item{margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid rgba(255,255,255,.05)}.minimax-tts-editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.minimax-tts-editor-row-flex{display:flex;align-items:center;gap:6px}.minimax-tts-editor-row-flex label{min-width:36px;font-size:.82rem;opacity:.7}.minimax-tts-editor-actions{display:flex;gap:10px;padding:12px 16px;border-top:1px solid rgba(255,255,255,.08)}.minimax-tts-editor-actions .menu_button{flex:1}.mm-fab-wrap{position:fixed;bottom:80px;right:24px;z-index:9998;touch-action:none}.mm-fab{width:52px;height:52px;border-radius:50%;background:var(--SmartThemeBlurTintColor,#2a2d3e);border:2px solid rgba(255,255,255,.15);box-shadow:0 4px 16px rgba(0,0,0,.4);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1.3rem;color:#7eb8ff;transition:all .2s;user-select:none;overflow:hidden}.mm-fab:hover{transform:scale(1.08);border-color:rgba(110,160,255,.4)}.mm-fab.generating{color:#ff9800;animation:mm-fab-pulse 1s infinite}.mm-fab img{width:100%;height:100%;object-fit:cover;border-radius:50%}@keyframes mm-fab-pulse{0%,100%{opacity:1}50%{opacity:.4}}';
+    st.textContent += `
+#mm_mobile_float_btn{
+    display:none;
+    position:fixed;
+    right:14px;
+    bottom:78px;
+    width:44px;
+    height:44px;
+    border-radius:50%;
+    background:rgba(76,175,80,.92);
+    color:#fff;
+    z-index:2147483000;
+    align-items:center;
+    justify-content:center;
+    font-size:20px;
+    box-shadow:0 4px 16px rgba(0,0,0,.35);
+    cursor:pointer;
+}
+
+#mm_mobile_float_btn:hover{
+    background:rgba(76,175,80,1);
+}
+
+@media screen and (max-width: 700px){
+    #mm_mobile_float_btn{
+        display:flex!important;
+    }
+
+    .mm-config-mask{
+        z-index:2147483001!important;
+        align-items:flex-start!important;
+        justify-content:center!important;
+        padding:calc(env(safe-area-inset-top, 0px) + 48px) 8px 8px 8px!important;
+        box-sizing:border-box!important;
+    }
+
+    .mm-config-dialog{
+        width:calc(100vw - 16px)!important;
+        max-width:calc(100vw - 16px)!important;
+        height:calc(100dvh - env(safe-area-inset-top, 0px) - 64px)!important;
+        max-height:calc(100dvh - env(safe-area-inset-top, 0px) - 64px)!important;
+        border-radius:12px!important;
+    }
+
+    .mm-config-header{
+        padding:8px 10px!important;
+        gap:4px!important;
+    }
+
+    .mm-tab{
+        padding:6px 8px!important;
+        font-size:.78rem!important;
+    }
+
+    .mm-config-body{
+        padding:10px!important;
+    }
+
+    .mm-config-dialog .mm-row{
+        flex-wrap:wrap!important;
+        align-items:flex-start!important;
+        gap:6px!important;
+    }
+
+    .mm-config-dialog .mm-row>label{
+        min-width:72px!important;
+        font-size:.8rem!important;
+    }
+
+    .mm-config-dialog .text_pole{
+        min-width:0!important;
+        font-size:.82rem!important;
+    }
+
+    .mm-binding-row,
+    .mm-voice-lib-row,
+    .mm-rule-row{
+        flex-wrap:wrap!important;
+    }
+
+    .minimax-tts-editor-dialog{
+        width:calc(100vw - 16px)!important;
+        max-width:calc(100vw - 16px)!important;
+        height:calc(100dvh - 32px)!important;
+        max-height:calc(100dvh - 32px)!important;
+    }
+}
+`;
+
     document.head.appendChild(st);
 }
 
@@ -802,6 +1147,7 @@ function renderBindings() {
             + '<select class="text_pole b-model">' + MODEL_OPTIONS.map(function (o) { return '<option value="' + o.value + '">' + o.label + '</option>'; }).join('') + '</select>'
             + '<select class="text_pole b-voice-lib mm-voice-sel">' + vo + '</select>'
             + '<input class="text_pole b-voice" placeholder="voiceId" value="' + escHtml(lm ? '' : b.voiceId || '') + '" style="' + (lm ? 'display:none' : '') + '">'
+            + '<input class="text_pole b-aliases" placeholder="别名(逗号分隔)" value="' + escHtml(b.aliases || '') + '" style="min-width:120px">'
             + '<button class="menu_button b-del" style="padding:4px 10px;flex-shrink:0">×</button>'
             + '</div>');
         row.find('.b-type').val(b.targetType).on('change', function () { b.targetType = $(this).val(); renderBindings(); saveSettingsDebounced(); });
@@ -809,6 +1155,7 @@ function renderBindings() {
         row.find('.b-model').val(b.model || s().model).on('change', function () { b.model = $(this).val(); saveSettingsDebounced(); });
         row.find('.b-voice-lib').val(lm ? b.voiceId : '').on('change', function () { var v2 = $(this).val(); b.voiceId = v2; row.find('.b-voice').toggle(!v2).val(''); saveSettingsDebounced(); });
         row.find('.b-voice').on('input', function () { b.voiceId = $(this).val(); saveSettingsDebounced(); });
+        row.find('.b-aliases').on('input', function () { b.aliases = $(this).val(); saveSettingsDebounced(); });
         row.find('.b-del').on('click', function () { s().characterBindingsMap[cid].splice(i, 1); renderBindings(); saveSettingsDebounced(); });
         ct.append(row);
     });
@@ -835,6 +1182,8 @@ function populateConfigFields() {
     el('mm_tts_lang').value = set.ttsLanguage || '';
     el('mm_autoplay').checked = set.autoPlay !== false;
     el('mm_show_bubbles').checked = set.showBubbles || false;
+    el('mm_show_fab').checked = set.showFloatingBtn !== false;
+    el('mm_fab_img').value = set.floatingBtnImg || '';
     renderVoiceLibrary(); refreshVoiceSelects();
     var vs = el('mm_voice_sel'), vi = el('mm_voice');
     var lm = null;
@@ -846,6 +1195,9 @@ function populateConfigFields() {
     refreshAllLlmPresetSelects();
     if ((s().llmPresets || []).length > 0) { el('mm_llm_presets').value = 0; loadLlmPresetFieldsGlobal(0); }
     if (set.formatterPresetIdx >= 0) el('mm_f_preset_sel').value = set.formatterPresetIdx;
+    el('mm_def_male').value = set.defaultMaleVoiceId || '';
+    el('mm_def_female').value = set.defaultFemaleVoiceId || '';
+    el('mm_auto_clear').value = set.autoClearInterval || 0;  
     renderRules(); renderRegexPresets(); renderPreProcessRules(); renderBindings();
 }
 
@@ -878,14 +1230,24 @@ function openConfigPanel() {
             + '<div class="mm-row"><label>语言</label><select id="mm_tts_lang" class="text_pole"><option value="">自动</option><option value="zh">中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="es">Español</option><option value="pt">Português</option><option value="id">Indonesia</option><option value="ar">العربية</option></select><span class="mm-inline-hint">克隆声音建议指定</span></div>'
             + '<div class="mm-row"><label>自动播放</label><input id="mm_autoplay" type="checkbox"></div>'
             + '<div class="mm-row"><label>语音气泡</label><input id="mm_show_bubbles" type="checkbox"><span class="mm-inline-hint">仅在引号对话后显示</span></div>'
+            + '<div class="mm-row"><label>悬浮按钮</label><input id="mm_show_fab" type="checkbox"></div>'
+            + '<div class="mm-row"><label>按钮图片</label><input id="mm_fab_img" class="text_pole" placeholder="图片URL"></div>'
             + '<div class="mm-row"><button id="mm_test_tts" class="menu_button"><i class="fa-solid fa-play"></i> 测试语音</button></div>'
+            + '<div class="mm-row"><button id="mm_clear_cache" class="menu_button" style="background:#ef5350"><i class="fa-solid fa-trash"></i> 清除所有语音缓存</button></div>'
             + '<div class="mm-section-title">语音库 <button id="mm_add_voice" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+添加</button></div>'
             + '<p class="mm-desc">为语音ID起名。</p>'
             + '<div id="mm_voice_lib_rows"></div>'
             + '<div class="mm-section-title" style="margin-top:16px">角色绑定 <button id="mm_add_b" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+添加</button></div>'
             + '<p class="mm-desc">为角色分配专属音色。</p>'
             + '<div id="mm_b_rows"></div>'
+            + '<div class="mm-section-title" style="margin-top:16px">默认NPC音色</div>'
+            + '<p class="mm-desc">未匹配到绑定的角色，根据性别使用默认声音（需LLM返回gender字段）。</p>'
+            + '<div class="mm-row"><label>默认男声</label><input id="mm_def_male" class="text_pole" placeholder="voiceId"></div>'
+            + '<div class="mm-row"><label>默认女声</label><input id="mm_def_female" class="text_pole" placeholder="voiceId"></div>'
+            + '<div class="mm-section-title" style="margin-top:16px">自动清理</div>'
+            + '<div class="mm-row"><label>每N楼清理旧缓存</label><input id="mm_auto_clear" class="text_pole" type="number" min="0" step="1" style="max-width:80px"><span class="mm-inline-hint">0=关闭，4=每4楼清理之前的缓存</span></div>'
             + '</div>'
+
 
             // ─── LLM面板 ───
             + '<div class="mm-tab-panel" data-panel="llm">'
@@ -914,6 +1276,9 @@ function openConfigPanel() {
             + '<p class="mm-desc">发给副LLM前的正则处理。</p>'
             + '<div class="mm-rule-header-row"><span></span><span>名称</span><span>正则</span><span style="flex:0 0 68px">模式</span><span style="flex:0 0 30px"></span></div>'
             + '<div id="mm_pre_rule_rows"></div>'
+            + '<div class="mm-section-title" style="margin-top:16px">调用日志 <button id="mm_clear_log" class="menu_button" style="font-size:0.8rem;padding:3px 10px">清除</button></div>'
+            + '<div id="mm_log_box" style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:0.78rem;color:#aaa"></div>'
+            + '<div class="mm-row" style="margin-top:12px"><button id="mm_manual_gen" class="menu_button" style="flex:1"><i class="fa-solid fa-wand-magic-sparkles"></i> 手动分析最后一条消息</button></div>'
             + '</div>'
 
             + '</div></div></div>';
@@ -951,6 +1316,12 @@ function openConfigPanel() {
             s().vol = Number(document.getElementById('mm_vol').value);
             s().ttsLanguage = document.getElementById('mm_tts_lang').value;
             s().autoPlay = document.getElementById('mm_autoplay').checked;
+            s().showFloatingBtn = document.getElementById('mm_show_fab').checked;
+            s().floatingBtnImg = document.getElementById('mm_fab_img').value || '';
+            if (window._mmFabUpdate) window._mmFabUpdate();
+            s().defaultMaleVoiceId = document.getElementById('mm_def_male').value || '';
+            s().defaultFemaleVoiceId = document.getElementById('mm_def_female').value || '';
+            s().autoClearInterval = Number(document.getElementById('mm_auto_clear').value) || 0;
             saveSettingsDebounced();
             syncToSTSecrets((s().apiKey || '').trim(), (s().groupId || '').trim());
         };
@@ -964,7 +1335,8 @@ function openConfigPanel() {
             s().showBubbles = this.checked;saveSettingsDebounced();if (this.checked) refreshAllBubbles(); else removeAllBubbles();
         });
 
-        var syncIds = ['mm_key', 'mm_gid', 'mm_apihost', 'mm_custom_host', 'mm_model', 'mm_voice_sel', 'mm_voice', 'mm_speed', 'mm_vol', 'mm_tts_lang', 'mm_autoplay'];
+        var syncIds = ['mm_key', 'mm_gid', 'mm_apihost', 'mm_custom_host', 'mm_model', 'mm_voice_sel', 'mm_voice', 'mm_speed', 'mm_vol', 'mm_tts_lang', 'mm_autoplay', 'mm_def_male', 'mm_def_female', 'mm_auto_clear','mm_show_fab', 'mm_fab_img'];
+
         for (var si = 0; si < syncIds.length; si++) {
             var syncEl = document.getElementById(syncIds[si]);
             if (syncEl) { syncEl.addEventListener('input', syncTts); syncEl.addEventListener('change', syncTts); }
@@ -976,14 +1348,27 @@ function openConfigPanel() {
 
         //测试语音
         document.getElementById('mm_test_tts').addEventListener('click', async function () {
-            try {
-                var testTexts = { '': '你好，我是MiniMax语音。', zh: '你好，我是MiniMax语音。', en: 'Hello, I am MiniMax voice.', ja: 'こんにちは', ko: '안녕하세요' };
-                var t = testTexts[s().ttsLanguage || ''] || testTexts[''];
-                var b = await getAudioBlob({ text: t, options: buildSynthesisOptions(null, null), serverPath: null });
-                new Audio(URL.createObjectURL(b)).play();
-                toastr.success('连通成功！');
-            } catch (e) { toastr.error('测试失败: ' + e.message); }
+    try {
+        var testTexts = { '': '你好，我是MiniMax语音。', zh: '你好，我是MiniMax语音。', en: 'Hello, I am MiniMax voice.', ja: 'こんにちは', ko: '안녕하세요' };
+        var t = testTexts[s().ttsLanguage || ''] || testTexts[''];
+        var b = await getAudioBlob({ text: t, options: buildSynthesisOptions(null, null), serverPath: null });
+        if (b && b._audioUrl) {
+            new Audio(b._audioUrl).play();
+        } else {
+            new Audio(URL.createObjectURL(b)).play();
+        }
+        toastr.success('连通成功！');
+    } catch (e) { toastr.error('测试失败: ' + e.message); }
+});
+        document.getElementById('mm_clear_cache').addEventListener('click', function () {
+            s().serverHistory = {};
+            localAudioCache.clear();
+            saveSettingsDebounced();
+            removeAllBubbles();
+            refreshAllMessageButtons();
+            toastr.success('缓存已全部清除');
         });
+
 
         // 语音库
         document.getElementById('mm_add_voice').addEventListener('click', function () {
@@ -1242,9 +1627,32 @@ function openConfigPanel() {
             } catch (e) { toastr.error(e.message); }
         });
 
-        upFT();}
+                upFT();
+
+        document.getElementById('mm_clear_log').addEventListener('click', function () {
+            ttsLogs = [];
+            document.getElementById('mm_log_box').innerHTML = '';
+        });
+
+        document.getElementById('mm_manual_gen').addEventListener('click', async function () {
+            var ctx = getContext();
+            if (!ctx.chat || !ctx.chat.length) { toastr.warning('没有消息'); return; }
+            var lastIdx = ctx.chat.length - 1;
+            for (var gi = lastIdx; gi >= 0; gi--) {
+                if (!ctx.chat[gi].is_user) { lastIdx = gi; break; }
+            }
+            ttsLog('手动触发分析 消息#' + lastIdx);
+            toastr.info('分析中...');
+            var ok = await generateMessageSpeech(lastIdx, true);
+            if (ok) {
+                injectBubbles(lastIdx);
+                toastr.success('分析完成！');
+            }
+        });
+    }
 
     populateConfigFields();
+
     document.getElementById('mm-config-mask').classList.add('mm-config-open');
 }
 
@@ -1258,6 +1666,18 @@ function createUi() {
         '<div id="mm_wand_item" class="list-group-item flex-container flexGap5" title="MiniMax TTS">'
         + '<div class="fa-solid fa-volume-high extensionsMenuExtensionButton"></div>MiniMax语音</div>'
     );
+
+    if (!document.getElementById('mm_mobile_float_btn')) {
+        var mobBtn = document.createElement('div');
+        mobBtn.id = 'mm_mobile_float_btn';
+        mobBtn.className = 'fa-solid fa-volume-high';
+        mobBtn.title = 'MiniMax语音';
+        mobBtn.addEventListener('click', function () {
+            openConfigPanel();
+        });
+        document.body.appendChild(mobBtn);
+    }
+
     $('#mm_wand_item').on('click', function () {
         var m = document.getElementById('extensionsMenu');
         if (m) m.style.display = 'none';
@@ -1267,6 +1687,169 @@ function createUi() {
     syncToSTSecrets((s().apiKey || '').trim(), (s().groupId || '').trim());
     refreshAllLlmPresetSelects();eventSource.on(event_types.CHARACTER_SELECTED, function () { if (document.getElementById('mm_b_rows')) renderBindings(); });
     eventSource.on(event_types.CHAT_CHANGED, function () { if (document.getElementById('mm_b_rows')) renderBindings(); });
+    // 悬浮按钮
+    var fabHtml = '<div class="mm-fab-wrap" id="mm_fab_wrap" style="display:none">'
+        + '<div class="mm-fab" id="mm_fab" title="点击生成语音 /再点取消">'
+        + '<i class="fa-solid fa-headphones"></i>'
+        + '</div></div>';
+    document.body.insertAdjacentHTML('beforeend', fabHtml);
+
+    var fabGenerating = false, fabAbort = null;
+    var fabDragging = false, fabMoved = false;
+    var fabStartX = 0, fabStartY = 0, fabOrigX = 0, fabOrigY = 0;
+
+    function applyFabPosition() {
+        var w = document.getElementById('mm_fab_wrap');
+        if (!w) return;
+
+        if (typeof s().floatingBtnX === 'number' && typeof s().floatingBtnY === 'number') {
+            w.style.left = s().floatingBtnX + 'px';
+            w.style.top = s().floatingBtnY + 'px';
+            w.style.right = 'auto';
+            w.style.bottom = 'auto';
+        } else {
+            w.style.left = 'auto';
+            w.style.top = 'auto';
+            w.style.right = '24px';
+            w.style.bottom = '80px';
+        }
+    }
+
+    function setFabIcon() {
+        var fab = document.getElementById('mm_fab');
+        if (!fab) return;
+        if (fabGenerating) {
+            fab.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+        } else if (s().floatingBtnImg) {
+            fab.innerHTML = '<img src="' + escHtml(s().floatingBtnImg) + '">';
+        } else {
+            fab.innerHTML = '<i class="fa-solid fa-headphones"></i>';
+        }
+    }
+
+    function updateFabVisibility() {
+        var w = document.getElementById('mm_fab_wrap');
+        if (w) {
+            w.style.display = s().showFloatingBtn ? '' : 'none';
+            applyFabPosition();
+        }
+        setFabIcon();
+    }
+
+    updateFabVisibility();
+
+    var fabWrap = document.getElementById('mm_fab_wrap');
+    var fabBtn = document.getElementById('mm_fab');
+
+    fabBtn.addEventListener('pointerdown', function (e) {
+        if (e.button !== undefined && e.button !== 0) return;
+
+        fabDragging = true;
+        fabMoved = false;
+        fabStartX = e.clientX;
+        fabStartY = e.clientY;
+
+        var rect = fabWrap.getBoundingClientRect();
+        fabOrigX = rect.left;
+        fabOrigY = rect.top;
+
+        fabBtn.setPointerCapture && fabBtn.setPointerCapture(e.pointerId);
+        e.preventDefault();
+    });
+
+    fabBtn.addEventListener('pointermove', function (e) {
+        if (!fabDragging) return;
+
+        var dx = e.clientX - fabStartX;
+        var dy = e.clientY - fabStartY;
+
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) fabMoved = true;
+
+        var nx = fabOrigX + dx;
+        var ny = fabOrigY + dy;
+
+        var maxX = window.innerWidth - fabWrap.offsetWidth;
+        var maxY = window.innerHeight - fabWrap.offsetHeight;
+
+        nx = Math.max(0, Math.min(maxX, nx));
+        ny = Math.max(0, Math.min(maxY, ny));
+
+        fabWrap.style.left = nx + 'px';
+        fabWrap.style.top = ny + 'px';
+        fabWrap.style.right = 'auto';
+        fabWrap.style.bottom = 'auto';
+
+        e.preventDefault();
+    });
+
+    fabBtn.addEventListener('pointerup', function (e) {
+        if (!fabDragging) return;
+        fabDragging = false;
+
+        if (fabMoved) {
+            var rect = fabWrap.getBoundingClientRect();
+            s().floatingBtnX = Math.round(rect.left);
+            s().floatingBtnY = Math.round(rect.top);
+            saveSettingsDebounced();
+
+            // 防止拖拽结束触发click
+            setTimeout(function () { fabMoved = false; }, 120);
+        }
+
+        fabBtn.releasePointerCapture && fabBtn.releasePointerCapture(e.pointerId);
+        e.preventDefault();
+    });
+
+    fabBtn.addEventListener('pointercancel', function () {
+        fabDragging = false;
+        setTimeout(function () { fabMoved = false; }, 120);
+    });
+
+    document.getElementById('mm_fab').addEventListener('click', async function () {
+        if (fabMoved) return;
+        var fab = this;
+        if (fabGenerating) {
+            fabGenerating = false;
+            if (fabAbort) fabAbort.cancelled = true;
+            fab.classList.remove('generating');
+            fab.innerHTML = s().floatingBtnImg ? '<img src="' + escHtml(s().floatingBtnImg) + '">' : '<i class="fa-solid fa-headphones"></i>';
+            toastr.warning('已取消生成');
+            return;
+        }
+
+        var ctx = getContext();
+        if (!ctx.chat || !ctx.chat.length) { toastr.warning('没有消息'); return; }
+        var lastIdx = -1;
+        for (var gi = ctx.chat.length - 1; gi >= 0; gi--) {
+            if (!ctx.chat[gi].is_user) { lastIdx = gi; break; }
+        }
+        if (lastIdx < 0) { toastr.warning('没有AI消息'); return; }
+
+        var token = { cancelled: false };
+        fabAbort = token;
+        fabGenerating = true;
+        fab.classList.add('generating');
+        fab.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+        ttsLog('悬浮按钮: 开始生成 消息#' + lastIdx);
+
+        try {
+            var ok = await generateMessageSpeech(lastIdx, true);
+            if (token.cancelled) return;
+            if (ok) {
+                injectBubbles(lastIdx);
+                toastr.success('语音生成完成！');
+            }
+        } catch (e) {
+            if (!token.cancelled) toastr.error('生成失败: ' + e.message);
+        }
+
+        fabGenerating = false;
+        fabAbort = null;
+        fab.classList.remove('generating');
+        fab.innerHTML = s().floatingBtnImg ? '<img src="' + escHtml(s().floatingBtnImg) + '">' : '<i class="fa-solid fa-headphones"></i>';
+    });
+
+    window._mmFabUpdate = updateFabVisibility;
 }
 
 jQuery(async function () {
@@ -1274,15 +1857,27 @@ jQuery(async function () {
     createUi();
 
     var timer, longP;
-
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async function (id) {
-        if (s().enabled && s().autoPlay) {
-            if (await generateMessageSpeech(id, false)) playGeneratedMessage(id);
-        } else {
-            extractSegmentsOnly(id);
+        // 自动清理旧缓存
+        var clearN = s().autoClearInterval || 0;
+        if (clearN > 0 && id > clearN) {
+            var ctx2 = getContext();
+            for (var ci = 0; ci < id - clearN; ci++) {
+                var cm = ctx2.chat[ci];
+                if (!cm) continue;
+                var ck = buildMessageKey(ctx2, ci, cm);
+                if (s().serverHistory[ck]) {
+                    delete s().serverHistory[ck];
+                }
+            }
+            saveSettingsDebounced();
         }
+
+        // 只注入已有的气泡，不自动生成
         injectBubbles(id);
     });
+
+
 
     eventSource.on(event_types.CHAT_CHANGED, function () {
         setTimeout(refreshAllBubbles, 600);
@@ -1316,7 +1911,9 @@ jQuery(async function () {
             var data = getMessageData(id);
             if (s().formatterEnabled) {
                 if (!s().serverHistory[data.key] || !s().serverHistory[data.key].versions || !s().serverHistory[data.key].versions.length) {
-                    toastr.warning('请先长按');
+                    toastr.info('分析中...');
+                    await generateMessageSpeech(id, true);
+                    injectBubbles(id);
                     return;
                 }
                 playGeneratedMessage(id);
@@ -1337,31 +1934,38 @@ jQuery(async function () {
     }, 1000);
 
     // 气泡点击播放
-    $(document).on('click', '.mm-bubble', async function () {
-        var $b = $(this);
-        if ($b.hasClass('mm-bubble-loading') || $b.hasClass('mm-bubble-playing')) return;
-        var mesid = Number($b.data('mesid'));
-        var segidx = Number($b.data('segidx'));
-        var data = getMessageData(mesid);
-        var h = s().serverHistory[data.key];
-        if (!h || !h.versions || !h.versions[h.activeIndex]) return;
-        var item = h.versions[h.activeIndex].items[segidx];
-        if (!item) return;
+$(document).on('click', '.mm-bubble', async function () {
+    var $b = $(this);
+    if ($b.hasClass('mm-bubble-loading') || $b.hasClass('mm-bubble-playing')) return;
+    var mesid = Number($b.data('mesid'));
+    var segidx = Number($b.data('segidx'));
+    var data = getMessageData(mesid);
+    var h = s().serverHistory[data.key];
+    if (!h || !h.versions || !h.versions[h.activeIndex]) return;
+    var item = h.versions[h.activeIndex].items[segidx];
+    if (!item) return;
 
-        $b.addClass('mm-bubble-loading');
-        try {
-            var blob = await getAudioBlob(item);
-            $b.removeClass('mm-bubble-loading').addClass('mm-bubble-playing');
-            refreshBubbleStates(mesid);
-            refreshAllMessageButtons();
+    $b.addClass('mm-bubble-loading');
+    try {
+        var blob = await getAudioBlob(item);
+        $b.removeClass('mm-bubble-loading').addClass('mm-bubble-playing');
+        refreshBubbleStates(mesid);
+        refreshAllMessageButtons();
+        if (blob && blob._audioUrl) {
+            var a = new Audio(blob._audioUrl);
+            a.onended = function () { $b.removeClass('mm-bubble-playing'); };
+            a.onerror = function () { $b.removeClass('mm-bubble-playing'); };
+            await a.play();
+        } else {
             var u = URL.createObjectURL(blob);
             var a = new Audio(u);
             a.onended = function () { URL.revokeObjectURL(u); $b.removeClass('mm-bubble-playing'); };
             a.onerror = function () { URL.revokeObjectURL(u); $b.removeClass('mm-bubble-playing'); };
             await a.play();
-        } catch (e) {
-            $b.removeClass('mm-bubble-loading mm-bubble-playing');
-            toastr.error('播放失败: ' + e.message);
-        }
-    });
+        }} catch (e) {
+        $b.removeClass('mm-bubble-loading mm-bubble-playing');
+        toastr.error('播放失败: ' + e.message);
+    }
+});
+
 });
