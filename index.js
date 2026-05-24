@@ -3852,6 +3852,9 @@ function createUi() {
         fabWrap.style.right = 'auto';
         fabWrap.style.bottom = 'auto';
 
+        // 拖动悬浮按钮时关闭已打开的操作菜单，避免菜单停在旧位置
+        closeActionMenu();
+
         e.preventDefault();
     });
 
