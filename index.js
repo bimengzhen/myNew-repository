@@ -3072,6 +3072,44 @@ st.textContent += `
 `;
 
     // ===== [修改结束] =====
+    st.textContent += `
+#mm_fab_wrap,
+.mm-fab-wrap {
+    position: fixed !important;
+    z-index: 2147483000 !important;
+
+    width: 52px !important;
+    height: 52px !important;
+    min-width: 52px !important;
+    min-height: 52px !important;
+    max-width: 52px !important;
+    max-height: 52px !important;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    pointer-events: auto !important;
+    touch-action: none !important;
+    user-select: none !important;
+
+    overflow: visible !important;
+}
+
+#mm_fab {
+    pointer-events: auto !important;
+    touch-action: none !important;
+    user-select: none !important;
+}
+
+@media screen and (max-width: 700px) {
+    #mm_fab_wrap,
+    .mm-fab-wrap {
+        z-index: 2147483000 !important;
+    }
+}
+`;
+
     document.head.appendChild(st);
 
 }
@@ -3579,7 +3617,13 @@ function openConfigPanel() {
 
         //测试语音
         document.getElementById('mm_test_tts').addEventListener('click', async function () {
+            var btn = this;
+            var oldText = btn.textContent;
+
             try {
+                btn.disabled = true;
+                btn.textContent = '测试中...';
+
                 var testTexts = {
                     '': '你好，我是MiniMax语音。',
                     zh: '你好，我是MiniMax语音。',
@@ -3589,26 +3633,69 @@ function openConfigPanel() {
                 };
 
                 var t = testTexts[s().ttsLanguage || ''] || testTexts[''];
-                var b = await getAudioBlob({
+
+                ttsLog('测试语音开始: ' + t);
+
+                var item = {
                     text: t,
                     options: buildSynthesisOptions(null, null),
                     serverPath: null,
-                });
+                };
+
+                var b = await getAudioBlob(item);
+
+                activeAudio.pause();
+                activeAudio.src = '';
 
                 if (b && b._audioUrl) {
-                    var a1 = new Audio(b._audioUrl);
-                    await a1.play();
-                } else {
+                    activeAudio.src = b._audioUrl;
+                    ttsLog('测试音频URL: ' + b._audioUrl.slice(0, 120));
+                } else if (b instanceof Blob) {
                     var u1 = URL.createObjectURL(b);
-                    var a2 = new Audio(u1);
-                    a2.onended = function () { URL.revokeObjectURL(u1); };
-                    a2.onerror = function () { URL.revokeObjectURL(u1); };
-                    await a2.play();
+                    activeAudio.src = u1;
+
+                    activeAudio.onended = function () {
+                        URL.revokeObjectURL(u1);
+                    };
+
+                    activeAudio.onerror = function () {
+                        URL.revokeObjectURL(u1);
+                    };
+
+                    ttsLog('测试音频Blob大小: ' + b.size + ' bytes');
+                } else {
+                    throw new Error('没有拿到有效音频');
+                }
+
+                try {
+                    await activeAudio.play();
+                } catch (playErr) {
+                    console.warn('[MiniMax TTS] 浏览器阻止播放:', playErr);
+
+                    if (playErr && (playErr.name === 'NotAllowedError' || /gesture|user/i.test(playErr.message || ''))) {
+                        toastr.warning('音频已生成，但浏览器阻止自动播放，请再点一次测试或手动播放');
+                        throw new Error('浏览器阻止自动播放');
+                    }
+
+                    throw playErr;
                 }
 
                 toastr.success('连通成功！');
+                ttsLog('测试语音成功', 'success');
             } catch (e) {
-                toastr.error('测试失败: ' + e.message);
+                console.error('[MiniMax TTS] 测试失败:', e);
+                ttsLog('测试失败: ' + (e.message || e), 'error');
+
+                var msg = e.message || String(e);
+
+                if (/Failed to fetch|NetworkError|CORS/i.test(msg)) {
+                    msg = '请求失败，通常是代理接口不可用或浏览器CORS拦截。请确认 /api/minimax/generate-voice 是否存在，或使用可跨域的中转站。';
+                }
+
+                toastr.error('测试失败: ' + msg);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = oldText;
             }
         });
 
@@ -4195,6 +4282,14 @@ function createUi() {
     }
 
     updateFabVisibility();
+    window.addEventListener('resize', function () {
+        applyFabPosition();
+    });
+
+    window.addEventListener('orientationchange', function () {
+        setTimeout(applyFabPosition, 300);
+    });
+
 
     var fabWrap = document.getElementById('mm_fab_wrap');
     var fabBtn = document.getElementById('mm_fab');
