@@ -95,7 +95,7 @@ function isHtmlMessage(mes) { return /class="|<div[\s>]|<table|<details|<summary
 function simpleHash(t) { if (!t) return 0; let h = 0; for (let i = 0; i < t.length; i++) h = ((h << 5) - h) + t.charCodeAt(i), h |= 0; return Math.abs(h); }
 function normalizeRegexFlags(v, ensureGlobal) {
     var raw = String(v || '').toLowerCase();
-    var allowed = 'dgimsuvy';
+    var allowed = 'dgimsuy';
     var out = '';
 
     for (var i = 0; i < raw.length; i++) {
@@ -199,15 +199,59 @@ async function extractAudioFromResponse(d, fmt) {
         }
     }
     var a = d.data?.audio || d.audio || d.audio_data || d.data?.audio_data;
+
     if (a && typeof a === 'string' && !a.startsWith('http')) {
-        var bc = atob(a), ba = new Uint8Array(bc.length);
-        for (var j = 0; j < bc.length; j++) ba[j] = bc.charCodeAt(j);
-        var mm = { mp3: 'audio/mpeg', wav: 'audio/wav', pcm: 'audio/pcm', flac: 'audio/flac' };
-        return new Blob([ba], { type: mm[fmt] || 'audio/mpeg' });
+        var mm = {
+            mp3: 'audio/mpeg',
+            wav: 'audio/wav',
+            pcm: 'audio/pcm',
+            flac: 'audio/flac',
+        };
+
+        // 如果看起来像十六进制，按 hex 解码
+        if (/^[0-9a-fA-F]+$/.test(a) && a.length % 2 === 0) {
+            return new Blob([
+                new Uint8Array(a.match(/.{1,2}/g).map(function (b) {
+                    return parseInt(b, 16);
+                })),
+            ], {
+                type: mm[fmt] || 'audio/mpeg',
+            });
+        }
+
+        // 否则按 base64 解码
+        try {
+            var bc = atob(a);
+            var ba = new Uint8Array(bc.length);
+
+            for (var j = 0; j < bc.length; j++) {
+                ba[j] = bc.charCodeAt(j);
+            }
+
+            return new Blob([ba], {
+                type: mm[fmt] || 'audio/mpeg',
+            });
+        } catch (e) {
+            throw new Error('音频数据既不是有效base64，也不是hex');
+        }
     }
     var h = d.data?.audio_hex || d.audio_hex;
+
     if (h && typeof h === 'string') {
-        return new Blob([new Uint8Array(h.match(/.{1,2}/g).map(function (b) { return parseInt(b, 16); }))], { type: 'audio/mpeg' });
+        var hm = {
+            mp3: 'audio/mpeg',
+            wav: 'audio/wav',
+            pcm: 'audio/pcm',
+            flac: 'audio/flac',
+        };
+
+        return new Blob([
+            new Uint8Array(h.match(/.{1,2}/g).map(function (b) {
+                return parseInt(b, 16);
+            })),
+        ], {
+            type: hm[fmt] || 'audio/mpeg',
+        });
     }
     throw new Error('API返回格式无法识别');
 }
@@ -218,38 +262,83 @@ async function pollTaskResult(baseUrl, headers, taskId) {
     const MAX = 60, INT = 2000;
     const urls = [
         baseUrl + '/' + taskId,
-        baseUrl + '?task_id=' + taskId,];
+        baseUrl + '?task_id=' + taskId,
+    ];
+
     for (let i = 0; i < MAX; i++) {
         await new Promise(r => setTimeout(r, INT));
-        for (constpu of (i === 0 ? urls : [urls[0]])) {
+
+        for (const pu of (i === 0 ? urls : [urls[0]])) {
             try {
                 let r = await fetch(pu, { method: 'GET', headers });
-                if (r.status === 405|| r.status === 404) {
-                    r = await fetch(baseUrl, { method: 'POST', headers, body: JSON.stringify({ task_id: taskId }) });
+
+                if (r.status === 405 || r.status === 404) {
+                    r = await fetch(baseUrl, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ task_id: taskId }),
+                    });
                 }
-                if (!r.ok) continue;
+
+                if (!r.ok) {
+                    continue;
+                }
+
                 const ct = (r.headers.get('content-type') || '').toLowerCase();
-                if (ct.includes('audio/') || ct.includes('octet-stream')) return await r.blob();
+
+                if (ct.includes('audio/') || ct.includes('octet-stream')) {
+                    return await r.blob();
+                }
+
                 const d = await r.json();
+
                 console.log('[MiniMax TTS] 轮询#' + (i + 1) + ':', JSON.stringify(d).slice(0, 300));
+
                 const st = (d.status || d.data?.status || '').toLowerCase();
-                if (st === 'error' || st === 'failed') throw new Error(d.message || d.error || '任务失败');
-                if (['completed', 'done', 'success', 'finished'].includes(st)) return await extractAudioFromResponse(d, 'mp3');
-                if (getAudioFieldFromResponse(d)) return await extractAudioFromResponse(d, 'mp3');
-                if (i === 0) { urls.length = 0; urls.push(pu); }
+
+                if (st === 'error' || st === 'failed') {
+                    throw new Error(d.message || d.error || '任务失败');
+                }
+
+                if (['completed', 'done', 'success', 'finished'].includes(st)) {
+                    return await extractAudioFromResponse(d, 'mp3');
+                }
+
+                if (getAudioFieldFromResponse(d)) {
+                    return await extractAudioFromResponse(d, 'mp3');
+                }
+
+                if (i === 0) {
+                    urls.length = 0;
+                    urls.push(pu);
+                }
+
                 break;
-            } catch (e) { if (e.message.includes('任务失败')) throw e; }
+            } catch (e) {
+                if (String(e && e.message || '').includes('任务失败')) {
+                    throw e;
+                }
+            }
         }
     }
+
     throw new Error('任务超时');
 }
 
+
 async function directMinimaxTts(text, options) {
     const set = s(), apiKey = (set.apiKey || '').trim();
-    if (!apiKey) throw new Error('请先填写API Key');
+
+    if (!apiKey) {
+        throw new Error('请先填写API Key');
+    }
 
     let url;
     const apiHost = (set.apiHost || DEFAULT_API_HOST).replace(/\/+$/, '');
+
+    if (apiHost !== 'custom' && !(set.groupId || '').trim()) {
+        throw new Error('请先填写Group ID');
+    }
 
     if (apiHost === 'custom') {
         const ch = (set.customApiHost || '').trim().replace(/\/+$/, '');
@@ -350,10 +439,14 @@ async function directMinimaxTts(text, options) {
 
 async function getAudioBlob(item) {
     const ck = 'tts_' + simpleHash(item.text) + '_' + simpleHash(JSON.stringify(item.options));
-    if (localAudioCache.has(ck)) return localAudioCache.get(ck);
+
+    if (localAudioCache.has(ck)) {
+        return localAudioCache.get(ck);
+    }
 
     if (item.serverPath) {
         const r = await fetch(item.serverPath, { headers: getRequestHeaders() });
+
         if (r.ok) {
             const b = await r.blob();
             localAudioCache.set(ck, b);
@@ -362,38 +455,60 @@ async function getAudioBlob(item) {
     }
 
     let blob;
+
     try {
         const r = await fetch(PROXY_ENDPOINT, {
             method: 'POST',
-            headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+            headers: {
+                ...getRequestHeaders(),
+                'Content-Type': 'application/json',
+            },
             body: JSON.stringify({
                 text: item.text,
+
+                // MiniMax 基础配置
                 apiHost: s().apiHost,
+                customApiHost: s().customApiHost || '',
+                apiKey: s().apiKey || '',
+                groupId: s().groupId || '',
+
+                // 合成参数
                 model: item.options.model,
                 voiceId: item.options.voiceId,
                 speed: item.options.speed,
                 volume: item.options.vol,
+                vol: item.options.vol,
                 pitch: item.options.pitch,
                 format: item.options.audioFormat,
+                audioFormat: item.options.audioFormat,
                 emotion: item.options.emotion,
                 language: item.options.language || undefined,
             }),
         });
 
-        if (r.status === 404|| r.status === 501|| r.status === 405) {
+        if (r.status === 404 || r.status === 501 || r.status === 405) {
             throw new Error('NO_PROXY');
         }
 
         if (!r.ok) {
             let m = 'HTTP' + r.status;
+
             try {
                 const e = await r.json();
                 m = e.error || e.message || m;
             } catch (_) {}
+
             throw new Error(m);
         }
 
-        blob = await r.blob();
+        const ct = (r.headers.get('content-type') || '').toLowerCase();
+
+        if (ct.includes('application/json')) {
+            const d = await r.json();
+            blob = await extractAudioFromResponse(d, item.options.audioFormat || 'mp3');
+        } else {
+            blob = await r.blob();
+        }
     } catch (pe) {
         console.warn('[MiniMax] 代理失败,直连:', pe.message);
         blob = await directMinimaxTts(item.text, item.options);
@@ -413,23 +528,28 @@ async function getAudioBlob(item) {
 
             try {
                 var sh = s().serverHistory || {};
+
                 for (var key in sh) {
                     var h = sh[key];
+
                     if (!h || !h.versions) continue;
 
                     for (var vi = 0; vi < h.versions.length; vi++) {
                         var ver = h.versions[vi];
+
                         if (!ver || !ver.items) continue;
 
                         for (var ii = 0; ii < ver.items.length; ii++) {
                             var it = ver.items[ii];
+
                             if (!it) continue;
 
                             var same = simpleHash(it.text) === simpleHash(item.text)
                                 && simpleHash(JSON.stringify(it.options)) === simpleHash(JSON.stringify(item.options));
 
                             if (same && !it.serverPath) {
-                                it.serverPath = p;}
+                                it.serverPath = p;
+                            }
                         }
                     }
                 }
@@ -441,6 +561,7 @@ async function getAudioBlob(item) {
 
     return blob;
 }
+
 
 
 async function playNext() {
@@ -613,18 +734,34 @@ async function formatWithSecondaryApi(m, cachedItemsForLabeling) {
         throw new Error('LLM返回空内容');
     }
 
-    // 清理markdown代码块
-    var cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+    function extractJsonObjectFromText(rawText) {
+        var raw = String(rawText || '').trim();
+        var codeBlock = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+
+        if (codeBlock && codeBlock[1]) {
+            raw = codeBlock[1].trim();
+        }
+
+        var start = raw.indexOf('{');
+        var end = raw.lastIndexOf('}');
+
+        if (start < 0 || end <= start) {
+            return '';
+        }
+
+        return raw.slice(start, end + 1);
+    }
+
+    var cleaned = extractJsonObjectFromText(text);
     ttsLog('清理后: ' + cleaned.slice(0, 300));
 
-    var match = cleaned.match(/\{[\s\S]*\}/);
-    if (!match) {
-        ttsLog('无法提取JSON: ' + cleaned.slice(0, 200), 'error');
+    if (!cleaned) {
+        ttsLog('无法提取JSON: ' + text.slice(0, 200), 'error');
         throw new Error('AI返回无有效JSON');
     }
 
     try {
-        var parsed = JSON.parse(match[0]);
+        var parsed = JSON.parse(cleaned);
         var labels = parsed.segments || [];
         ttsLog('LLM标注返回 ' + labels.length + ' 个标签', 'success');
 
@@ -671,7 +808,7 @@ async function formatWithSecondaryApi(m, cachedItemsForLabeling) {
 
         return segments;
     } catch (e) {
-        ttsLog('JSON解析失败: ' + e.message + ' 原文: ' + match[0].slice(0, 200), 'error');
+        ttsLog('JSON解析失败: ' + e.message + ' 原文: ' + cleaned.slice(0, 200), 'error');
         throw new Error('JSON解析失败: ' + e.message);
     }
 }    
@@ -789,6 +926,11 @@ function runRegexExtraction(cleanText, rules, speaker) {
         }
 
         while ((qm = re.exec(cleanText)) !== null) {
+            if (!qm[0]) {
+                re.lastIndex++;
+                continue;
+            }
+
             var inner = '';
 
             for (var capi = 1; capi < qm.length; capi++) {
@@ -847,7 +989,7 @@ function runRegexExtraction(cleanText, rules, speaker) {
 
             var overlap = cur.pos < old.end && cur.end > old.pos;
 
-            if (samePos || sameFull || sameText && overlap || overlap) {
+            if (samePos || sameFull || (sameText && overlap)) {
                 duplicated = true;
 
                 // 如果当前这个更长，就替换旧的
@@ -893,15 +1035,28 @@ function runRegexExtraction(cleanText, rules, speaker) {
 
 
 function extractForLlmLabeling(text) {
+    text = String(text || '');
+
     var extracted = [];
 
     function addMatches(pattern, type) {
         var re = new RegExp(pattern, 'gs');
         var m;
+
         while ((m = re.exec(text)) !== null) {
+            // 防止零宽匹配导致死循环
+            if (!m[0]) {
+                re.lastIndex++;
+                continue;
+            }
+
             var full = (m[0] || '').trim();
             var inner = (m[1] || '').trim();
-            if (!inner || inner.length < 1) continue;
+
+            if (!inner || inner.length < 1) {
+                continue;
+            }
+
             extracted.push({
                 idx: extracted.length,
                 text: inner,
@@ -913,28 +1068,35 @@ function extractForLlmLabeling(text) {
     }
 
     // 引号
-    addMatches('["\u201c\u300c\u300e\u2018]([\s\S]{1,500}?)["\u201d\u300d\u300f\u2019]', 'quote');
+    addMatches('["\\u201c\\u300c\\u300e\\u2018]([\\s\\S]{1,500}?)["\\u201d\\u300d\\u300f\\u2019]', 'quote');
 
     // 星号
-    addMatches('\\*([\s\S]{1,500}?)\\*', 'action');
+    addMatches('\\*([\\s\\S]{1,500}?)\\*', 'action');
 
     // 按原文顺序排序
-    extracted.sort(function (a, b) { return a.pos - b.pos; });
+    extracted.sort(function (a, b) {
+        return a.pos - b.pos;
+    });
 
     // 重新编号
-    for (var i = 0; i < extracted.length; i++) extracted[i].idx = i;
+    for (var i = 0; i < extracted.length; i++) {
+        extracted[i].idx = i;
+    }
 
     return extracted;
 }
 
 async function generateMessageSpeech(id, forced) {
+    if (!s().enabled) {
+        return false;
+    }
+
     var data = getMessageData(id);
     var message = data.message, key = data.key;
-    if (!message || (s().onlyCharacter && message.is_user)) return false;
-    if (!message || message.is_system || (s().onlyCharacter && message.is_user)) return false;
 
-    // 酒馆斜体/Markdown 可能会渲染成 HTML，这里不能直接跳过
-    // if (isHtmlMessage(message.mes)) return false;
+    if (!message || message.is_system || (s().onlyCharacter && message.is_user)) {
+        return false;
+    }
 
     console.log('[MiniMax TTS] === 生成语音 === id=' + id + ' forced=' + forced + ' formatterEnabled=' + s().formatterEnabled + ' enabled=' + s().enabled);
 
@@ -943,6 +1105,7 @@ async function generateMessageSpeech(id, forced) {
     // 格式化器开启时，自动清除旧的正则数据
     if (s().formatterEnabled && !forced && h && h.versions && h.versions.length) {
         var v = h.versions[h.activeIndex];
+
         if (v && !v._fromFormatter) {
             console.log('[MiniMax TTS] 检测到旧正则数据，清除重新分析');
             delete s().serverHistory[key];
@@ -957,6 +1120,7 @@ async function generateMessageSpeech(id, forced) {
 
     try {
         var raw;
+
         if (s().formatterEnabled) {
             console.log('[MiniMax TTS] 调用副LLM分析...');
             console.log('[MiniMax TTS] presetIdx=' + s().formatterPresetIdx + ' presets数量=' + (s().llmPresets || []).length);
@@ -977,7 +1141,8 @@ async function generateMessageSpeech(id, forced) {
         } else {
             var ct = s().ignoreCodeBlocks ? message.mes.replace(/```[\s\S]*?```/g, ' ') : message.mes;
             var rules = (s().regexRules || []).filter(function (r) { return r.enabled; });
-            raw = rules.length ? runRegexExtraction(ct, rules, message.name) : [];}
+            raw = rules.length ? runRegexExtraction(ct, rules, message.name) : [];
+        }
 
         if (!raw || !raw.length) {
             console.warn('[MiniMax TTS] 未找到可朗读内容');
@@ -1000,97 +1165,115 @@ async function generateMessageSpeech(id, forced) {
                 apiLabeled: isApiLabeledRun,
             };
         });
-        if (false && s().formatterEnabled && message.mes) {
-            var origText = message.mes;
 
-            function normText(x) {
-                return String(x || '')
-                    .replace(/\s+/g, '')
-                    .replace(/[""]/g, '"')
-                    .replace(/['']/g, "'")
-                    .replace(/[（）]/g, function (c) { return c === '（' ? '(' : ')'; })
-                    .trim();
+        var origText = message.mes || '';
+
+        function normText(v) {
+            return String(v || '')
+                .replace(/<[^>]+>/g, '')
+                .replace(/\s+/g, '')
+                .toLowerCase();
+        }
+
+        function findFuzzyInOrig(segText) {
+            if (!segText) return '';
+
+            // 1. 原文直接匹配
+            if (origText.indexOf(segText) >= 0) return segText;
+
+            // 2. 各种包裹符号匹配
+            var wraps = [
+                ['\u201c', '\u201d'],
+                ['\u300c', '\u300d'],
+                ['\u300e', '\u300f'],
+                ['\u2018', '\u2019'],
+                ['"', '"'],
+                ["'", "'"],
+                ['(', ')'],
+                ['\uff08', '\uff09'],
+                ['*', '*'],
+            ];
+
+            for (var wi = 0; wi < wraps.length; wi++) {
+                var wrapped = wraps[wi][0] + segText + wraps[wi][1];
+
+                if (origText.indexOf(wrapped) >= 0) {
+                    return segText;
+                }
             }
 
-            function findFuzzyInOrig(segText) {
-                if (!segText) return '';
+            // 3. 去掉首尾包裹符号再匹配
+            var trimmed = String(segText || '')
+                .replace(/^[“”「」『』‘’"'（）()*\s]+/, '')
+                .replace(/[“”「」『』‘’"'（）()*\s]+$/, '');
 
-                // 1. 原文直接匹配
-                if (origText.indexOf(segText) >= 0) return segText;
+            if (trimmed && origText.indexOf(trimmed) >= 0) {
+                return trimmed;
+            }
 
-                // 2. 各种包裹符号匹配
-                var wraps = [
-                    ['\u201c','\u201d'], ['\u300c','\u300d'], ['\u300e','\u300f'], ['\u2018','\u2019'],
-                    ['"','"'], ["'","'"],
-                    ['(',')'], ['\uff08','\uff09'],
-                    ['*','*']
-                ];
+            // 4. 忽略空白的模糊匹配
+            var nSeg = normText(trimmed || segText);
 
-                for (var wi = 0; wi < wraps.length; wi++) {
-                    var wrapped = wraps[wi][0] + segText + wraps[wi][1];
-                    if (origText.indexOf(wrapped) >= 0) {
-                        // 注意：fullMatch 用segText，更容易在渲染后的DOM里找到
-                        return segText;
-                    }
-                }
-
-                // 3. 去掉首尾包裹符号再匹配
-                var trimmed = segText
-                    .replace(/^[""「」『』''"'（）()*\s]+/, '')
-                    .replace(/[""「」『』''"'（）()*\s]+$/, '');
-
-                if (trimmed && origText.indexOf(trimmed) >= 0) return trimmed;
-
-                // 4. 忽略空白的模糊匹配
-                var nSeg = normText(trimmed || segText);
-                if (!nSeg) return '';
-
-                var raw = origText;
-                var rawNorm = normText(raw);
-
-                if (rawNorm.indexOf(nSeg) >= 0) {
-                    // 模糊匹配成功时，返回原始segText，让injectAfterText尝试插入
-                    return trimmed || segText;
-                }
-
-                // 5. 长句部分匹配，取前12个非空白字符试试
-                if (nSeg.length >= 12) {
-                    var shortKey = nSeg.slice(0, 12);
-                    if (rawNorm.indexOf(shortKey) >= 0) {
-                        return trimmed || segText;
-                    }
-                }
-
+            if (!nSeg) {
                 return '';
             }
 
-            for (var qi = 0; qi < items.length; qi++) {
-                if (items[qi].fullMatch) continue;
+            var rawNorm = normText(origText);
 
-                var segText = items[qi].text || '';
-                var fm = findFuzzyInOrig(segText);
+            if (rawNorm.indexOf(nSeg) >= 0) {
+                return trimmed || segText;
+            }
 
-                if (fm) {
-                    items[qi].fullMatch = fm;
-                    console.log('[MiniMax TTS] 气泡匹配成功#' + qi + ': ' + fm.slice(0, 40));
-                } else {
-                    console.warn('[MiniMax TTS] 气泡匹配失败#' + qi + ': ' + segText.slice(0, 60));
+            // 5. 长句部分匹配，取前 12 个非空白字符试试
+            if (nSeg.length >= 12) {
+                var shortKey = nSeg.slice(0, 12);
+
+                if (rawNorm.indexOf(shortKey) >= 0) {
+                    return trimmed || segText;
                 }
+            }
+
+            return '';
+        }
+
+        for (var qi = 0; qi < items.length; qi++) {
+            if (items[qi].fullMatch) continue;
+
+            var segText = items[qi].text || '';
+            var fm = findFuzzyInOrig(segText);
+
+            if (fm) {
+                items[qi].fullMatch = fm;
+                console.log('[MiniMax TTS] 气泡匹配成功#' + qi + ': ' + fm.slice(0, 40));
+            } else {
+                console.warn('[MiniMax TTS] 气泡匹配失败#' + qi + ': ' + segText.slice(0, 60));
             }
         }
 
+        console.log('[MiniMax TTS] 生成 ' + items.length + ' 个片段:', items.map(function (it) {
+            return it.speaker + ':' + it.text.slice(0, 20);
+        }));
 
+        if (!s().serverHistory[key]) {
+            s().serverHistory[key] = { activeIndex: 0, versions: [] };
+        }
 
-        console.log('[MiniMax TTS] 生成 ' + items.length + ' 个片段:', items.map(function(it) { return it.speaker + ':' + it.text.slice(0, 20); }));
+        var newVer = {
+            items: items,
+            timestamp: Date.now(),
+        };
 
-        if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
-        var newVer = { items: items, timestamp: Date.now() };
-        if (s().formatterEnabled) newVer._fromFormatter = true;
+        if (s().formatterEnabled) {
+            newVer._fromFormatter = true;
+        }
+
         s().serverHistory[key].versions.push(newVer);
         s().serverHistory[key].activeIndex = s().serverHistory[key].versions.length - 1;
+
         saveSettingsDebounced();
         refreshAllMessageButtons();
         injectBubbles(id);
+
         return true;
     } catch (e) {
         console.error('[MiniMax TTS] 生成失败:', e);
@@ -1098,6 +1281,7 @@ async function generateMessageSpeech(id, forced) {
         return false;
     }
 }
+
 
 
 function extractSegmentsOnly(id) {
@@ -1162,22 +1346,40 @@ function refreshAllMessageButtons() {
     document.querySelectorAll('#chat .mes[mesid]').forEach(function (el) {
         var id = el.getAttribute('mesid');
         var data = getMessageData(id);
-        if (!data.message || data.message.is_system || isHtmlMessage(data.message.mes)) return;
-        var extra = el.querySelector('.extraMesButtons'); if (!extra) return;
+
+        if (!data.message || data.message.is_system) {
+            return;
+        }
+
+        if (s().onlyCharacter && data.message.is_user) {
+            return;
+        }
+
+        var extra = el.querySelector('.extraMesButtons');
+
+        if (!extra) {
+            return;
+        }
+
         var btn = el.querySelector('.mes_quote_tts');
+
         if (!btn) {
             btn = document.createElement('div');
             btn.className = 'mes_button mes_quote_tts fa-solid fa-volume-high';
             extra.appendChild(btn);
         }
+
         var h = s().serverHistory[data.key];
         var ready = false;
+
         if (s().showBubbles && h && h.versions && h.versions[h.activeIndex] && h.versions[h.activeIndex].items.length > 0) {
             ready = h.versions[h.activeIndex].items.filter(function (it) { return !it.pauseMs && it.text; }).every(isBubbleCached);
         } else {
             ready = !!(h && h.versions && h.versions.length > 0);
         }
-        btn.classList.toggle('ready', ready);});
+
+        btn.classList.toggle('ready', ready);
+    });
 }
 
 function makeBubble(mesid, segidx, item, withText) {
@@ -2124,165 +2326,6 @@ async function handleActionClick(e) {
             break;
     }
 }
-//═══════════════ 内嵌编辑器 ═══════════════
-
-var editingMesId = null;
-
-function enterEditMode(mesid) {
-    exitEditMode();
-    editingMesId = mesid;
-
-    var mesEl = document.querySelector('#chat .mes[mesid="' + mesid + '"]');
-    if (!mesEl) return;
-    var textEl = mesEl.querySelector('.mes_text');
-    if (!textEl) return;
-
-    textEl.classList.add('mm-editing');
-
-    // 给每个气泡加删除按钮
-    textEl.querySelectorAll('.mm-bubble').forEach(function (bub) {
-        if (bub.querySelector('.mm-bubble-del')) return;
-        var del = document.createElement('span');
-        del.className = 'mm-bubble-del';
-        del.innerHTML = '×';
-        del.addEventListener('click', function (e) {
-            e.stopPropagation();
-            var idx = Number(bub.dataset.segidx);
-            deleteBubbleItem(mesid, idx);
-        });
-        bub.appendChild(del);
-    });
-
-    // 监听文字选中
-    textEl.addEventListener('mouseup', onEditSelect);
-    textEl.addEventListener('touchend', onEditSelect);
-
-    toastr.info('编辑模式：点×删除气泡，选中文字添加气泡。点消息外部退出。');
-
-    // 点外面退出
-    setTimeout(function () {
-        document.addEventListener('click', onEditOutsideClick);
-    }, 100);
-}
-
-function exitEditMode() {
-    if (editingMesId === null) return;
-    var mesEl = document.querySelector('#chat .mes[mesid="' + editingMesId + '"]');
-    if (mesEl) {
-        var textEl = mesEl.querySelector('.mes_text');
-        if (textEl) {
-            textEl.classList.remove('mm-editing');
-            textEl.removeEventListener('mouseup', onEditSelect);
-            textEl.removeEventListener('touchend', onEditSelect);
-        }
-    }
-    var addBtn = document.querySelector('.mm-add-bubble-btn');
-    if (addBtn) addBtn.remove();
-    document.removeEventListener('click', onEditOutsideClick);
-    editingMesId = null;
-}
-
-function onEditOutsideClick(e) {
-    if (!editingMesId) return;
-    var mesEl = document.querySelector('#chat .mes[mesid="' + editingMesId + '"]');
-    if (mesEl && mesEl.contains(e.target)) return;
-    if (e.target.closest('.mm-add-bubble-btn')) return;
-    if (e.target.closest('.mm-action-menu')) return;
-    exitEditMode();
-}
-
-function onEditSelect(e) {
-    // 移除旧的添加按钮
-    var old = document.querySelector('.mm-add-bubble-btn');
-    if (old) old.remove();
-
-    var sel = window.getSelection();
-    if (!sel || sel.isCollapsed || !sel.toString().trim()) return;
-
-    var selectedText = sel.toString().trim();
-    if (selectedText.length < 1) return;
-
-    var range = sel.getRangeAt(0);
-    var rect = range.getBoundingClientRect();
-
-    var btn = document.createElement('div');
-    btn.className = 'mm-add-bubble-btn';
-    btn.innerHTML = '<i class="fa-solid fa-plus"></i> 添加气泡';
-    btn.style.left = (rect.left + rect.width / 2 - 50) + 'px';
-    btn.style.top = (rect.top - 32) + 'px';
-    document.body.appendChild(btn);
-
-    btn.addEventListener('click', function () {
-        btn.remove();
-        addBubbleFromSelection(editingMesId, selectedText);sel.removeAllRanges();
-    });
-}
-
-function deleteBubbleItem(mesid, segidx) {
-    var data = getMessageData(mesid);
-    var h = s().serverHistory[data.key];
-    if (!h || !h.versions || !h.versions[h.activeIndex]) return;
-
-    var items = h.versions[h.activeIndex].items;
-    if (segidx >= 0 && segidx < items.length) {
-        var removed = items[segidx];
-        console.log('[MiniMax TTS] 删除气泡#' + segidx + ':', removed.text.slice(0, 30));
-        items.splice(segidx, 1);
-        saveSettingsDebounced();
-
-        // 重新注入
-        var wasEditing = editingMesId === mesid;
-        exitEditMode();
-        injectBubbles(mesid);
-        refreshAllMessageButtons();
-        if (wasEditing) enterEditMode(mesid);
-    }
-}
-
-function addBubbleFromSelection(mesid, selectedText) {
-    var data = getMessageData(mesid);
-    var message = data.message;
-    if (!message) return;
-
-    var key = data.key;
-    if (!s().serverHistory[key]) {
-        s().serverHistory[key] = { activeIndex: 0, versions: [] };
-    }
-    var h = s().serverHistory[key];
-    if (!h.versions.length) {
-        h.versions.push({ items: [], timestamp: Date.now() });
-        h.activeIndex = 0;
-    }
-
-    var items = h.versions[h.activeIndex].items;
-
-    // 查找说话人
-    var speaker = message.name || '未知';
-    if (items.length > 0) {
-        speaker = items[items.length - 1].speaker || speaker;
-    }
-
-    var newItem = {
-        text: selectedText,
-        fullMatch: selectedText,
-        speaker: speaker,
-        options: buildSynthesisOptions({ text: selectedText, speaker: speaker }, message),
-        serverPath: null,
-    };
-
-    items.push(newItem);
-    saveSettingsDebounced();
-
-    console.log('[MiniMax TTS] 添加气泡:', selectedText.slice(0, 30), '说话人:', speaker);
-
-    // 重新注入
-    var wasEditing = editingMesId === mesid;
-    exitEditMode();
-    injectBubbles(mesid);
-    refreshAllMessageButtons();
-    if (wasEditing) enterEditMode(mesid);
-    toastr.success('已添加气泡');
-}
 
 
 function openParamsEditor(id) {
@@ -2295,6 +2338,11 @@ function openParamsEditor(id) {
         var rows = '';
         for (var i = 0; i < v.items.length; i++) {
             var it = v.items[i];
+
+            if (!it.options) {
+                it.options = buildSynthesisOptions(it, data.message);
+            }
+
             rows += '<div class="minimax-tts-editor-item">'
                 + '<div style="font-size:0.8rem;opacity:0.6;margin-bottom:4px">说话人:'
                 + '<input class="edit-v" data-prop="speaker" data-idx="' + i + '" value="' + escHtml(it.speaker || '') + '" style="width:100px;height:20px!important;display:inline-block;border:none!important;background:none!important;color:inherit!important;padding:0!important">'
@@ -2373,75 +2421,169 @@ function injectStyles() {
     st.id = 'mm-tts-css';
     st.textContent = '.mm-config-mask{display:none;position:fixed;inset:0;z-index:2147483001!important;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);justify-content:center;align-items:center;padding:16px}.mm-config-mask.mm-config-open{display:flex!important}.mm-config-dialog{width:min(680px,96vw);max-height:92vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}.mm-config-header{display:flex;align-items:center;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.08);flex-shrink:0;gap:8px}.mm-config-close{background:none;border:none;color:inherit;font-size:1.2rem;cursor:pointer;padding:4px 8px;opacity:.6;flex-shrink:0}.mm-config-close:hover{opacity:1}.mm-config-body{flex:1;overflow-y:auto;padding:16px}.mm-tab-bar{display:flex;gap:2px;flex:1;flex-wrap:wrap}.mm-tab{background:transparent;border:none;color:inherit;padding:6px 14px;cursor:pointer;border-radius:8px 8px 0 0;font-size:.88rem;opacity:.55;white-space:nowrap}.mm-tab:hover{opacity:.8;background:rgba(255,255,255,.04)}.mm-tab.active{opacity:1;background:rgba(255,255,255,.08);font-weight:600}.mm-tab-panel{display:none}.mm-tab-panel.active{display:block}.mm-config-dialog .mm-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}.mm-config-dialog .mm-row>label{min-width:85px;flex-shrink:0;font-size:.88rem;opacity:.8}.mm-config-dialog .text_pole{flex:1;min-width:0;max-width:100%;box-sizing:border-box;height:34px!important;font-size:.88rem!important}.mm-config-dialog textarea.text_pole{height:auto!important;min-height:64px;resize:vertical}.mm-config-dialog select.text_pole{flex:1;min-width:0}.mm-config-dialog input[type=checkbox]{flex:none;width:18px;height:18px}.mm-section-title{font-weight:600;font-size:.95rem;margin:16px 0 8px;display:flex;align-items:center;gap:10px}.mm-desc{font-size:.82rem;opacity:.55;margin:0 0 10px;line-height:1.4}.mm-inline-hint{font-size:.78rem;opacity:.45;margin-left:6px}.mm-voice-lib-row,.mm-binding-row,.mm-rule-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}.mm-rule-header-row{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:.78rem;opacity:.45}.mm-rule-header-row>span{flex:1}.mm-bubble-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-top:6px;border-top:1px dashed rgba(255,255,255,.08)}.mm-bubble{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;background:rgba(76,175,80,.15);color:var(--SmartThemeBodyColor,#ccc);font-size:.82rem;cursor:pointer;transition:background .15s;user-select:none;vertical-align:middle;margin:0 2px}.mm-bubble:hover{background:rgba(76,175,80,.3)}.mm-bubble i{font-size:.72rem;opacity:.6}.mm-bubble-cached{background:rgba(33,150,243,.15)}.mm-bubble-cached:hover{background:rgba(33,150,243,.3)}.mm-bubble-loading{opacity:.5;pointer-events:none}.mm-bubble-playing{background:rgba(255,152,0,.2);animation:mm-pulse .8s infinite alternate}@keyframes mm-pulse{from{opacity:.7}to{opacity:1}}.mes_quote_tts{cursor:pointer;opacity:.5;transition:opacity .15s}.mes_quote_tts:hover{opacity:1}.mes_quote_tts.ready{color:#4caf50;opacity:.8}.minimax-tts-editor-mask{position:fixed;inset:0;z-index:2147483002;background:rgba(0,0,0,.55);display:flex;justify-content:center;align-items:center;padding:16px}.minimax-tts-editor-dialog{width:min(720px,96vw);max-height:90vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}.minimax-tts-editor-header{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.08);gap:12px}.minimax-tts-editor-body{flex:1;overflow-y:auto;padding:16px}.minimax-tts-editor-item{padding:12px;margin-bottom:12px;border-radius:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06)}.minimax-tts-editor-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}.minimax-tts-editor-row-flex{display:flex;align-items:center;gap:6px}.minimax-tts-editor-row-flex label{min-width:40px;font-size:.82rem;opacity:.6}.minimax-tts-editor-actions{display:flex;gap:12px;padding:12px 16px;border-top:1px solid rgba(255,255,255,.08)}.minimax-tts-editor-actions .menu_button{flex:1}.mm-fab-wrap{position:fixed;right:24px;bottom:80px;z-index:2147483000}.mm-fab{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#4caf50,#2196f3);color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,.35);transition:transform .15s,box-shadow .15s;touch-action:none;user-select:none}.mm-fab:hover{transform:scale(1.08);box-shadow:0 6px 28px rgba(0,0,0,.45)}.mm-fab.generating{animation:mm-fab-spin 1.2s linear infinite}@keyframes mm-fab-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}.mm-fab img{width:36px;height:36px;border-radius:50%;object-fit:cover;pointer-events:none}';
     st.textContent += `
+    
 #mm_mobile_float_btn{
-    display:none!important;
+    display:none!important;visibility:hidden!important;
+    pointer-events:none!important;
 }
 #mm_mobile_float_btn:hover{
     display:none!important;
 }
 
-@media screen and (max-width: 700px){
-    #mm_mobile_float_btn{
-        display:none!important;
+@media screen and (max-width: 700px) {
+    #mm_mobile_float_btn {
+        display: none !important;
     }
 
-    .mm-config-mask{
-        z-index:2147483001!important;
-        align-items:flex-start!important;
-        justify-content:center!important;
-        padding:calc(env(safe-area-inset-top, 0px) + 48px) 8px 8px 8px!important;
-        box-sizing:border-box!important;
+    .mm-config-mask.mm-config-open {
+        display: flex !important;
+        position: fixed !important;
+        inset: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        overflow: hidden !important;
+        background: rgba(0, 0, 0, 0.55) !important;
+        z-index: 2147483001 !important;align-items: center !important;
+        justify-content: center !important;
+        box-sizing: border-box !important;
     }
 
-    .mm-config-dialog{
-        width:calc(100vw - 16px)!important;
-        max-width:calc(100vw - 16px)!important;
-        height:calc(100dvh - env(safe-area-inset-top, 0px) - 64px)!important;
-        max-height:calc(100dvh - env(safe-area-inset-top, 0px) - 64px)!important;border-radius:12px!important;
+    .mm-config-mask.mm-config-open .mm-config-dialog {
+        position: relative !important;
+        left: auto !important;
+        top: auto !important;
+        right: auto !important;
+        bottom: auto !important;
+        transform: none !important;
+
+        width: 94vw !important;
+        max-width: 420px !important;
+
+        height: auto !important;
+        max-height: 80dvh !important;
+
+        margin: 0 !important;
+        padding: 0 !important;
+
+        border-radius: 14px !important;
+        overflow: hidden !important;
+
+        display: flex !important;
+        flex-direction: column !important;
     }
 
-    .mm-config-header{
-        padding:8px 10px!important;
-        gap:4px!important;
+    .mm-config-mask.mm-config-open .mm-config-header {
+        flex-shrink: 0 !important;
+        padding: 7px 9px !important;
+        gap: 4px !important;
     }
 
-    .mm-tab{
-        padding:6px 8px!important;
-        font-size:.78rem!important;
+    .mm-config-mask.mm-config-open .mm-config-body {
+        flex: 1 1 auto !important;
+        overflow-y: auto !important;
+        max-height: calc(80dvh - 46px) !important;
+        padding: 10px !important;
+        -webkit-overflow-scrolling: touch !important;
     }
 
-    .mm-config-body{
-        padding:10px!important;
+    .mm-config-mask.mm-config-open .mm-tab-bar {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        overflow-x: auto !important;
+        gap: 2px !important;
+        scrollbar-width: none !important;
     }
 
-    .mm-config-dialog .mm-row{
-        flex-wrap:wrap!important;
-        align-items:flex-start!important;
-        gap:6px!important;
+    .mm-config-mask.mm-config-open .mm-tab-bar::-webkit-scrollbar {
+        display: none !important;
     }
 
-    .mm-config-dialog .mm-row>label{
-        min-width:72px!important;
-        font-size:.8rem!important;
+    .mm-config-mask.mm-config-open .mm-tab {
+        flex: 0 0 auto !important;
+        padding: 5px 8px !important;
+        font-size: 0.76rem !important;
+        white-space: nowrap !important;
     }
 
-    .mm-config-dialog .text_pole{
-        min-width:0!important;
-        font-size:.82rem!important;
+    .mm-config-mask.mm-config-open .mm-config-close {
+        font-size: 1rem !important;
+        padding: 3px 6px !important;
     }
 
+    .mm-config-mask.mm-config-open .mm-row {
+        flex-wrap: wrap !important;
+        align-items: flex-start !important;
+        gap: 5px !important;
+        margin-bottom: 8px !important;
+    }
+
+    .mm-config-mask.mm-config-open .mm-row > label {
+        min-width: 64px !important;
+        font-size: 0.78rem !important;
+    }
+
+    .mm-config-mask.mm-config-open .text_pole {
+        height: 30px !important;
+        font-size: 0.8rem !important;
+    }
+
+    .mm-config-mask.mm-config-open textarea.text_pole {
+        min-height: 52px !important;
+        max-height: 130px !important;
+    }
+
+    .mm-config-mask.mm-config-open .mm-section-title {
+        font-size: 0.86rem !important;
+        margin: 12px 0 6px !important;
+        gap: 6px !important;
+        flex-wrap: wrap !important;
+    }
+
+    .mm-config-mask.mm-config-open .mm-desc {
+        font-size: 0.76rem !important;
+        margin-bottom: 8px !important;
+    }
+
+    .mm-config-mask.mm-config-open #mm_log_box {
+        max-height: 110px !important;
+        font-size: 0.72rem !important;
+    }
+
+    .minimax-tts-editor-dialog {
+        width: calc(100vw - 16px) !important;
+        max-width: calc(100vw - 16px) !important;
+        height: calc(100dvh - 32px) !important;
+        max-height: calc(100dvh - 32px) !important;
+    }
+
+    .mm-rule-header-row {
+        font-size: 0.72rem !important;
+    }
+
+    .mm-rule-row,
     .mm-binding-row,
-    .mm-voice-lib-row,
-    .mm-rule-row{
-        flex-wrap:wrap!important;}
+    .mm-voice-lib-row {
+        gap: 5px !important;
+        flex-wrap: wrap !important;
+    }
 
-    .minimax-tts-editor-dialog{
-        width:calc(100vw - 16px)!important;
-        max-width:calc(100vw - 16px)!important;
-        height:calc(100dvh - 32px)!important;
-        max-height:calc(100dvh - 32px)!important;}
+    .mm-rule-row .text_pole,
+    .mm-binding-row .text_pole,
+    .mm-voice-lib-row .text_pole {
+        min-width: 120px !important;
+        flex: 1 1 120px !important;
+    }
+
+    #mm_log_box {
+        max-height: 120px !important;
+        font-size: 0.72rem !important;
+    }
 }
+
 `;
+
+        
+
 st.textContent += `
 .mm-action-menu{
     position:absolute;
@@ -2557,34 +2699,6 @@ st.textContent += `
     background:rgba(255,255,255,.16);
     transform:none!important;
 }
-.mm-editing .mm-bubble{
-    position:relative;
-    padding-right:22px;
-    border:1px dashed rgba(255,255,255,.2);
-}
-.mm-bubble-del{
-    position:absolute;right:2px;top:50%;transform:translateY(-50%);
-    width:16px;height:16px;border-radius:50%;
-    background:rgba(239,83,80,.7);color:#fff;
-    font-size:10px;line-height:16px;text-align:center;
-    cursor:pointer;display:none;
-}
-.mm-editing .mm-bubble-del{display:block}
-.mm-bubble-del:hover{background:#ef5350}
-.mm-add-bubble-btn{
-    position:absolute;z-index:2147483003;
-    padding:4px 12px;border-radius:8px;
-    background:rgba(76,175,80,.9);color:#fff;
-    font-size:.82rem;cursor:pointer;
-    box-shadow:0 4px 12px rgba(0,0,0,.3);
-    animation:mm-menu-in .12s ease;
-}
-.mm-add-bubble-btn:hover{background:#4caf50}
-.mm-editing .mm-bubble-strip{
-    border:1px dashed rgba(255,255,255,.15);
-    border-radius:8px;
-    padding:8px;
-}
 #mm_inline_editor_bar {
     position: fixed !important;
     left: 50% !important;
@@ -2619,13 +2733,7 @@ st.textContent += `
     cursor: pointer !important;
     font-weight: 700 !important;
 }
-    border: none !important;
-    outline: none !important;
-    border-radius: 999px !important;
-    padding: 6px 12px !important;
-    cursor: pointer !important;
-    font-weight: 700 !important;
-}
+
 
 .mm-inline-editor-save {
     background: #f4ead8 !important;
@@ -2675,7 +2783,6 @@ st.textContent += `
 }
 
 `;
-
 //===== [修改] 新增：悬浮快捷菜单 CSS =====
 st.textContent += `
 .mm-mob-menu{
@@ -3060,7 +3167,16 @@ function renderPreProcessRules() {
 function renderBindings() {
     var c = document.getElementById('mm_b_rows'); if (!c) return; c.innerHTML = '';
     var ctx = getContext(), cid = ctx.characterId || ctx.character_id || ctx.name2|| 'global';
-    var list = s().characterBindingsMap[cid] || [];
+
+    if (!s().characterBindingsMap) {
+        s().characterBindingsMap = {};
+    }
+
+    if (!Array.isArray(s().characterBindingsMap[cid])) {
+        s().characterBindingsMap[cid] = [];
+    }
+
+    var list = s().characterBindingsMap[cid];
 
     list.forEach(function (b, i) {
         var el = document.createElement('div'); el.className = 'mm-binding-row';
@@ -3100,6 +3216,11 @@ function el(id) { return document.getElementById(id); }
 
 function populateConfigFields() {
     var set = s();
+
+    if (!el('mm_key')) {
+        return;
+    }
+
     el('mm_key').value = set.apiKey || '';
     el('mm_gid').value = set.groupId || '';
     el('mm_apihost').value = set.apiHost || DEFAULT_API_HOST;
@@ -3134,6 +3255,148 @@ function populateConfigFields() {
     if (fSel && set.formatterPresetIdx >= 0) fSel.value = set.formatterPresetIdx;
     if (set.llmPresets.length && set.formatterPresetIdx >= 0) loadLlmPresetFieldsGlobal(set.formatterPresetIdx);
 }
+
+function applyMobileConfigPanelLayout() {
+    var mask = document.getElementById('mm-config-mask');
+    var dialog = mask ? mask.querySelector('.mm-config-dialog') : null;
+    var body = dialog ? dialog.querySelector('.mm-config-body') : null;
+    var header = dialog ? dialog.querySelector('.mm-config-header') : null;
+    var tabBar = dialog ? dialog.querySelector('.mm-tab-bar') : null;
+
+    if (!mask || !dialog) {
+        return;
+    }
+
+    // 只在面板打开时强制修复，避免影响关闭状态
+    if (!mask.classList.contains('mm-config-open')) {
+        return;
+    }
+
+    // 手机端/窄屏/触屏都强制走移动端面板布局
+    var isMobileLike = window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
+    if (!isMobileLike) {
+        return;
+    }
+
+    // ===== 强制显示遮罩，绕过所有 CSS 冲突 =====
+    mask.style.setProperty('display', 'flex', 'important');
+    mask.style.setProperty('visibility', 'visible', 'important');
+    mask.style.setProperty('opacity', '1', 'important');
+    mask.style.setProperty('pointer-events', 'auto', 'important');
+
+    mask.style.setProperty('position', 'fixed', 'important');
+    mask.style.setProperty('left', '0', 'important');
+    mask.style.setProperty('top', '0', 'important');
+    mask.style.setProperty('right', '0', 'important');
+    mask.style.setProperty('bottom', '0', 'important');
+    mask.style.setProperty('inset', '0', 'important');
+
+    mask.style.setProperty('width', '100vw', 'important');
+    mask.style.setProperty('height', '100vh', 'important');
+    mask.style.setProperty('height', '100dvh', 'important');
+
+    mask.style.setProperty('padding', '10px', 'important');
+    mask.style.setProperty('margin', '0', 'important');
+    mask.style.setProperty('box-sizing', 'border-box', 'important');
+    mask.style.setProperty('overflow', 'hidden', 'important');
+
+    mask.style.setProperty('align-items', 'center', 'important');
+    mask.style.setProperty('justify-content', 'center', 'important');
+
+    mask.style.setProperty('background', 'rgba(0, 0, 0, 0.55)', 'important');
+    mask.style.setProperty('z-index', '2147483647', 'important');
+
+    // ===== 强制显示面板本体，避免跑到屏幕外 =====
+    dialog.style.setProperty('display', 'flex', 'important');
+    dialog.style.setProperty('visibility', 'visible', 'important');
+    dialog.style.setProperty('opacity', '1', 'important');
+    dialog.style.setProperty('pointer-events', 'auto', 'important');
+
+    dialog.style.setProperty('position', 'relative', 'important');
+    dialog.style.setProperty('left', 'auto', 'important');
+    dialog.style.setProperty('top', 'auto', 'important');
+    dialog.style.setProperty('right', 'auto', 'important');
+    dialog.style.setProperty('bottom', 'auto', 'important');
+    dialog.style.setProperty('transform', 'none', 'important');
+
+    dialog.style.setProperty('width', '94vw', 'important');
+    dialog.style.setProperty('max-width', '430px', 'important');
+    dialog.style.setProperty('min-width', '0', 'important');
+
+    dialog.style.setProperty('height', '82dvh', 'important');
+    dialog.style.setProperty('max-height', '82dvh', 'important');
+    dialog.style.setProperty('min-height', '0', 'important');
+
+    dialog.style.setProperty('margin', '0', 'important');
+    dialog.style.setProperty('padding', '0', 'important');
+    dialog.style.setProperty('box-sizing', 'border-box', 'important');
+
+    dialog.style.setProperty('border-radius', '14px', 'important');
+    dialog.style.setProperty('overflow', 'hidden', 'important');
+    dialog.style.setProperty('flex-direction', 'column', 'important');
+
+    dialog.style.setProperty('background', 'var(--SmartThemeBlurTintColor, #1a1c2a)', 'important');
+    dialog.style.setProperty('color', 'var(--SmartThemeBodyColor, #ccc)', 'important');
+    dialog.style.setProperty('box-shadow', '0 12px 48px rgba(0,0,0,.55)', 'important');
+    dialog.style.setProperty('z-index', '2147483647', 'important');
+
+    if (header) {
+        header.style.setProperty('display', 'flex', 'important');
+        header.style.setProperty('align-items', 'center', 'important');
+        header.style.setProperty('flex-shrink', '0', 'important');
+        header.style.setProperty('padding', '7px 9px', 'important');
+        header.style.setProperty('gap', '4px', 'important');
+    }
+
+    if (body) {
+        body.style.setProperty('display', 'block', 'important');
+        body.style.setProperty('flex', '1 1 auto', 'important');
+        body.style.setProperty('height', 'calc(82dvh - 46px)', 'important');
+        body.style.setProperty('max-height', 'calc(82dvh - 46px)', 'important');
+        body.style.setProperty('min-height', '0', 'important');
+        body.style.setProperty('overflow-y', 'auto', 'important');
+        body.style.setProperty('padding', '10px', 'important');
+        body.style.setProperty('-webkit-overflow-scrolling', 'touch', 'important');
+    }
+
+    if (tabBar) {
+        tabBar.style.setProperty('display', 'flex', 'important');
+        tabBar.style.setProperty('flex-wrap', 'nowrap', 'important');
+        tabBar.style.setProperty('overflow-x', 'auto', 'important');
+        tabBar.style.setProperty('gap', '2px', 'important');
+    }
+
+    dialog.querySelectorAll('.mm-tab').forEach(function (tab) {
+        tab.style.setProperty('flex', '0 0 auto', 'important');
+        tab.style.setProperty('padding', '5px 8px', 'important');
+        tab.style.setProperty('font-size', '0.76rem', 'important');
+        tab.style.setProperty('white-space', 'nowrap', 'important');
+    });
+
+    dialog.querySelectorAll('.mm-row').forEach(function (row) {
+        row.style.setProperty('flex-wrap', 'wrap', 'important');
+        row.style.setProperty('align-items', 'flex-start', 'important');
+        row.style.setProperty('gap', '5px', 'important');
+        row.style.setProperty('margin-bottom', '8px', 'important');
+    });
+
+    dialog.querySelectorAll('.mm-row > label').forEach(function (label) {
+        label.style.setProperty('min-width', '64px', 'important');
+        label.style.setProperty('font-size', '0.78rem', 'important');
+    });
+
+    dialog.querySelectorAll('.text_pole').forEach(function (input) {
+        input.style.setProperty('font-size', '0.8rem', 'important');
+        input.style.setProperty('max-width', '100%', 'important');
+        input.style.setProperty('box-sizing', 'border-box', 'important');
+    });
+}
+
+
+
+
+
 
 function openConfigPanel() {
     if (!document.getElementById('mm-config-mask')) {
@@ -3238,12 +3501,36 @@ function openConfigPanel() {
 
         // 关闭
         document.getElementById('mm-config-mask').addEventListener('click', function (e) {
-            if (e.target === this) this.classList.remove('mm-config-open');
-        });document.querySelector('#mm-config-mask .mm-config-close').addEventListener('click', function () {
-            document.getElementById('mm-config-mask').classList.remove('mm-config-open');
+            if (e.target === this) {
+                this.classList.remove('mm-config-open');
+                this.removeAttribute('style');
+
+                var dialog = this.querySelector('.mm-config-dialog');
+
+                if (dialog) {
+                    dialog.removeAttribute('style');
+                }
+            }
         });
 
+        document.querySelector('#mm-config-mask .mm-config-close').addEventListener('click', function () {
+            var mask = document.getElementById('mm-config-mask');
+
+            if (mask) {
+                mask.classList.remove('mm-config-open');
+                mask.removeAttribute('style');
+
+                var dialog = mask.querySelector('.mm-config-dialog');
+
+                if (dialog) {
+                    dialog.removeAttribute('style');
+                }
+            }
+        });
+
+
         // TTS同步
+        var syncSecretsTimer = null;
         var syncTts = function () {
             var vs = document.getElementById('mm_voice_sel');
             s().apiKey = document.getElementById('mm_key').value;
@@ -3263,7 +3550,11 @@ function openConfigPanel() {
             s().defaultFemaleVoiceId = document.getElementById('mm_def_female').value || '';
             s().autoClearInterval = Number(document.getElementById('mm_auto_clear').value) || 0;
             saveSettingsDebounced();
-            syncToSTSecrets((s().apiKey || '').trim(), (s().groupId || '').trim());
+
+            clearTimeout(syncSecretsTimer);
+            syncSecretsTimer = setTimeout(function () {
+                syncToSTSecrets((s().apiKey || '').trim(), (s().groupId || '').trim());
+            }, 800);
         };
 
         document.getElementById('mm_apihost').addEventListener('change', function () {
@@ -3487,6 +3778,10 @@ function openConfigPanel() {
         document.getElementById('mm_regex_import').addEventListener('click', function () {
             var inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json';
             inp.onchange = async function () {
+                if (!inp.files || !inp.files[0]) {
+                    return;
+                }
+
                 try {
                     var d = JSON.parse(await inp.files[0].text());
                     if (Array.isArray(d)) {
@@ -3557,6 +3852,10 @@ function openConfigPanel() {
         document.getElementById('mm_f_import_t').addEventListener('click', function () {
             var inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json';
             inp.onchange = async function () {
+                if (!inp.files || !inp.files[0]) {
+                    return;
+                }
+
                 try {
                     var d = JSON.parse(await inp.files[0].text());
                     if (Array.isArray(d)) {
@@ -3701,8 +4000,41 @@ function openConfigPanel() {
 
     populateConfigFields();
 
-    document.getElementById('mm-config-mask').classList.add('mm-config-open');
+    var mask = document.getElementById('mm-config-mask');
+
+    if (mask) {
+        mask.classList.add('mm-config-open');
+
+        // 先立刻强制可见，避免手机端 CSS/旧内联样式导致第一帧不显示
+        mask.style.setProperty('display', 'flex', 'important');
+        mask.style.setProperty('visibility', 'visible', 'important');
+        mask.style.setProperty('opacity', '1', 'important');
+        mask.style.setProperty('pointer-events', 'auto', 'important');
+        mask.style.setProperty('position', 'fixed', 'important');
+        mask.style.setProperty('inset', '0', 'important');
+        mask.style.setProperty('z-index', '2147483647', 'important');
+    }
+
+    applyMobileConfigPanelLayout();
+
+    requestAnimationFrame(function () {
+        applyMobileConfigPanelLayout();
+    });
+
+    setTimeout(function () {
+        applyMobileConfigPanelLayout();
+    }, 60);
+
+    setTimeout(function () {
+        applyMobileConfigPanelLayout();
+    }, 200);
+
+    setTimeout(function () {
+        applyMobileConfigPanelLayout();
+    }, 500);
 }
+
+
 
 //═══════════════════════════════
 //  启动入口
@@ -3819,48 +4151,7 @@ function createUi() {
 
 
 
-    if (mmFab) {
-        mmFab.style.width = '72px';
-        mmFab.style.height = '72px';
-        mmFab.style.minWidth = '72px';
-        mmFab.style.minHeight = '72px';
-        mmFab.style.maxWidth = '72px';
-        mmFab.style.maxHeight = '72px';
-        mmFab.style.padding = '0';
-        mmFab.style.margin = '0';
-        mmFab.style.border = 'none';
-        mmFab.style.outline = 'none';
-        mmFab.style.boxShadow = 'none';
-        mmFab.style.background = 'transparent';
-        mmFab.style.backgroundColor = 'transparent';
-        mmFab.style.fontSize = '42px';
-        mmFab.style.lineHeight = '72px';
-        mmFab.style.display = 'flex';
-        mmFab.style.alignItems = 'center';
-        mmFab.style.justifyContent = 'center';
 
-        var mmFabIcon = mmFab.querySelector('i');
-        if (mmFabIcon) {
-            mmFabIcon.style.fontSize = '42px';
-            mmFabIcon.style.width = '72px';
-            mmFabIcon.style.height = '72px';
-            mmFabIcon.style.lineHeight = '72px';
-            mmFabIcon.style.display = 'flex';
-            mmFabIcon.style.alignItems = 'center';
-            mmFabIcon.style.justifyContent = 'center';
-        }
-
-        var mmFabImg = mmFab.querySelector('img');
-        if (mmFabImg) {
-            mmFabImg.style.width = '72px';
-            mmFabImg.style.height = '72px';
-            mmFabImg.style.minWidth = '72px';
-            mmFabImg.style.minHeight = '72px';
-            mmFabImg.style.maxWidth = '72px';
-            mmFabImg.style.maxHeight = '72px';
-            mmFabImg.style.objectFit = 'contain';
-        }
-    }
 
     var fabGenerating = false, fabAbort = null;
     var fabDragging = false, fabMoved = false;
