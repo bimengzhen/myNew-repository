@@ -3206,7 +3206,11 @@ function openConfigPanel() {
             + '<div class="mm-row"><label>LLM预设</label><select id="mm_f_preset_sel" class="text_pole llm-preset-sel"></select></div>'
             + '<div class="mm-row" style="flex-wrap:wrap;gap:6px"><label style="min-width:85px">模板</label><select id="mm_f_templates" class="text_pole" style="min-width:120px;flex:1"></select><button id="mm_f_save_t" class="menu_button">保存</button><button id="mm_f_upd_t" class="menu_button">更新</button><button id="mm_f_del_t" class="menu_button">删除</button><button id="mm_f_export_t" class="menu_button">导出</button><button id="mm_f_import_t" class="menu_button">导入</button></div>'
             + '<div class="mm-row" style="align-items:flex-start"><label style="padding-top:6px">系统提示词</label><textarea id="mm_f_prompt" class="text_pole" style="flex:1;width:0"></textarea></div>'
-            + '<div class="mm-section-title" style="margin-top:16px">预处理规则 <button id="mm_add_pre_rule" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+添加</button></div>'
+            + '<div class="mm-section-title" style="margin-top:16px">预处理规则 '
+            + '<button id="mm_add_pre_rule" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+添加</button> '
+            + '<button id="mm_pre_export" class="menu_button" style="font-size:0.8rem;padding:3px 10px">导出</button> '
+            + '<button id="mm_pre_import" class="menu_button" style="font-size:0.8rem;padding:3px 10px">导入</button>'
+            + '</div>'
             + '<p class="mm-desc">发给副LLM前的正则处理。</p>'
             + '<div class="mm-rule-header-row"><span></span><span>名称</span><span>正则</span><span style="flex:0 0 60px">Flags</span><span style="flex:0 0 68px">模式</span><span style="flex:0 0 30px"></span></div>'
             + '<div id="mm_pre_rule_rows"></div>'
@@ -3353,6 +3357,96 @@ function openConfigPanel() {
             if (!s().llmPreProcessRules) s().llmPreProcessRules = [];
             s().llmPreProcessRules.push({ id: 'p' + Date.now(), enabled: true, name: '新规则', pattern: '', flags: 'g', mode: 'exclude' });
             renderPreProcessRules(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_pre_export').addEventListener('click', function () {
+            var data = {
+                type: 'minimax_quote_tts_preprocess_rules',
+                version: 1,
+                rules: s().llmPreProcessRules || [],
+            };
+
+            var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+
+            a.href = url;
+            a.download = 'minimax_preprocess_rules.json';
+            a.click();
+
+            setTimeout(function () {
+                URL.revokeObjectURL(url);
+            }, 1000);
+
+            toastr.success('预处理规则已导出');
+        });
+
+        document.getElementById('mm_pre_import').addEventListener('click', function () {
+            var inp = document.createElement('input');
+
+            inp.type = 'file';
+            inp.accept = '.json,application/json';
+
+            inp.onchange = async function () {
+                if (!inp.files || !inp.files[0]) {
+                    return;
+                }
+
+                try {
+                    var text = await inp.files[0].text();
+                    var data = JSON.parse(text);
+                    var rules = [];
+
+                    if (Array.isArray(data)) {
+                        rules = data;
+                    } else if (data && Array.isArray(data.rules)) {
+                        rules = data.rules;
+                    } else if (data && Array.isArray(data.llmPreProcessRules)) {
+                        rules = data.llmPreProcessRules;
+                    } else {
+                        toastr.error('导入失败：文件里没有规则数组');
+                        return;
+                    }
+
+                    rules = rules.map(function (r, idx) {
+                        return {
+                            id: r.id || ('p' + Date.now() + '_' + idx),
+                            enabled: r.enabled !== false,
+                            name: r.name || ('导入规则' + (idx + 1)),
+                            pattern: r.pattern || '',
+                            flags: r.flags || 'g',
+                            mode: r.mode === 'extract' ? 'extract' : 'exclude',
+                        };
+                    }).filter(function (r) {
+                        return r.pattern;
+                    });
+
+                    if (!rules.length) {
+                        toastr.warning('没有可导入的有效规则');
+                        return;
+                    }
+
+                    if (!s().llmPreProcessRules) {
+                        s().llmPreProcessRules = [];
+                    }
+
+                    var replace = confirm('是否覆盖当前预处理规则？\n\n确定 = 覆盖\n取消 = 追加');
+
+                    if (replace) {
+                        s().llmPreProcessRules = rules;
+                    } else {
+                        s().llmPreProcessRules = s().llmPreProcessRules.concat(rules);
+                    }
+
+                    renderPreProcessRules();
+                    saveSettingsDebounced();
+
+                    toastr.success('已导入预处理规则：' + rules.length + '条');
+                } catch (e) {
+                    toastr.error('导入失败：' + e.message);
+                }
+            };
+
+            inp.click();
         });
 
         // 正则预设CRUD
