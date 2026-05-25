@@ -35,7 +35,7 @@ const defaults = {
     characterBindingsMap: {}, llmPresets: [], formatterTemplates: [],
     formatterEnabled: false, formatterPresetIdx: -1,
     formatterSystemPrompt: '请以严格的JSON格式返回：{"segments":[{"text":"...","speaker":"...","emotion":"...","speed":1.0,"vol":1.0,"pitch":0}]}.仅保留可朗读的内容。',
-    serverHistory: {}, voiceLibrary: [], regexRules: [], regexPresets: [],
+    serverHistory: {}, favoriteAudios: [], voiceLibrary: [], regexRules: [], regexPresets: [],
     llmPreProcessRules: [], showBubbles: false,
     defaultMaleVoiceId: '', defaultFemaleVoiceId: '',
     defaultMaleModel: '', defaultFemaleModel: '',
@@ -48,6 +48,8 @@ let playbackQueue = [], isPlaying = false;
 let activeAudio = new Audio();
 const localAudioCache = new Map();
 let mmInlineEditState = null;
+let mmBubbleLongPressTimer = null;
+let mmBubbleLongPressFired = false;
 
 
 function s() { return extension_settings[MODULE_NAME]; }
@@ -168,7 +170,7 @@ async function syncToSTSecrets(ak, gid) {
 async function proxyFetch(url, opt = {}) {
     const r = await fetch(url, {
         method: opt.method || 'GET',
-        headers: {'Content-Type': 'application/json', ...(opt.headers || {}) },
+        headers: { ...getRequestHeaders(), 'Content-Type': 'application/json', ...(opt.headers || {}) },
         body: opt.body != null ? JSON.stringify(opt.body) : undefined,
     });
     const t = await r.text();
@@ -1405,6 +1407,11 @@ function makeBubble(mesid, segidx, item, withText) {
         el.classList.add('mm-bubble-cached');
     }
 
+    if (isFavoriteAudioItem(item)) {
+        el.classList.add('mm-bubble-favorite');
+        el.title = '已收藏：' + (item.text || '');
+    }
+
     if (item && item.apiLabeled) {
         el.classList.add('mm-bubble-api-labeled');
         el.title = 'API已分析：'
@@ -2109,8 +2116,12 @@ function refreshAllBubbles() {
 //═══════════════ 操作菜单 ═══════════════
 
 function closeActionMenu() {
-    var m = document.querySelector('.mm-action-menu');
-    if (m) m.remove();
+    document.querySelectorAll('.mm-action-menu').forEach(function (m) {
+        m.remove();
+    });
+
+    document.removeEventListener('click', onOutsideClick);
+    document.removeEventListener('scroll', closeActionMenu, true);
 }
 
 function showActionMenu(mesid, anchorEl) {
@@ -2126,7 +2137,8 @@ function showActionMenu(mesid, anchorEl) {
         { icon: 'fa-solid fa-quote-left', label: '正则提取', id: 'regex' },
         { icon: 'fa-solid fa-robot', label: 'API分析', id: 'api' },
         { icon: 'fa-solid fa-pen', label: '编辑器', id: 'editor' },
-        { icon: 'fa-solid fa-rotate', label: '重新分析', id: 'reanalyze' },
+        { icon: 'fa-solid fa-sliders', label: '可视面板', id: 'visual_panel', need: true },
+        { icon: 'fa-solid fa-star', label: '我的收藏', id: 'favorites' },
         { icon: 'fa-solid fa-gear', label: '设置面板', id: 'settings' },
         { icon: 'fa-solid fa-trash', label: '清除缓存', id: 'clear', need: true, danger: true },
     ];
@@ -2209,8 +2221,7 @@ function showActionMenu(mesid, anchorEl) {
 
 function onOutsideClick(e) {
     if (e.target.closest && e.target.closest('.mm-action-menu')) return;
-    closeActionMenu();document.removeEventListener('click', onOutsideClick);
-    document.removeEventListener('scroll', closeActionMenu, true);
+    closeActionMenu();
 }
 
 async function handleActionClick(e) {
@@ -2258,53 +2269,12 @@ async function handleActionClick(e) {
             openInlineBubbleEditor(mesid);
             break;
 
-        case 'reanalyze':
-            // 重新分析：保留气泡文本，只清掉音频和API黄色标记
-            if (s().serverHistory[data.key]) {
-                if (!s()._undoHistory) {
-                    s()._undoHistory = {};
-                }
+        case 'visual_panel':
+            openVisualVoicePanel(mesid);
+            break;
 
-                s()._undoHistory[data.key] = JSON.parse(JSON.stringify(s().serverHistory[data.key]));
-
-                var h = s().serverHistory[data.key];
-
-                if (h && h.versions && h.versions.length) {
-                    for (var ri = 0; ri < h.versions.length; ri++) {
-                        var ver = h.versions[ri];
-
-                        if (!ver || !ver.items) {
-                            continue;
-                        }
-
-                        for (var rj = 0; rj < ver.items.length; rj++) {
-                            var item = ver.items[rj];
-
-                            if (!item) {
-                                continue;
-                            }
-
-                            // 清掉音频缓存路径
-                            item.serverPath = null;
-
-                            // 清掉API标记，让黄色变回绿色
-                            item.apiLabeled = false;
-
-                            // 顺便清理可能存在的旧标记
-                            delete item.apiLabeled;
-                        }
-                    }
-                }
-
-                saveSettingsDebounced();
-                injectBubbles(mesid);
-                refreshAllMessageButtons();
-
-                toastr.success('已清除音频和API标记，正则气泡已保留');
-            } else {
-                toastr.warning('没有可处理的缓存');
-            }
-
+        case 'favorites':
+            openFavoriteAudioPanel();
             break;
 
         case 'settings':
@@ -2327,6 +2297,697 @@ async function handleActionClick(e) {
     }
 }
 
+function openVisualVoicePanel(id) {
+    var data = getMessageData(id);
+    var h = s().serverHistory[data.key];
+
+    if (!h || !h.versions || !h.versions.length || !h.versions[h.activeIndex]) {
+        toastr.warning('当前楼层还没有可编辑的语音片段，请先正则提取或API分析');
+        return;
+    }
+
+    var version = h.versions[h.activeIndex];
+
+    if (!version.items) {
+        version.items = [];
+    }
+
+    var originalItems = cloneItems(version.items);
+    var workingItems = cloneItems(version.items);
+    var undoStack = [];
+    var currentSpeaker = '__ALL__';
+
+    function ensureOptions() {
+        for (var i = 0; i < workingItems.length; i++) {
+            var it = workingItems[i];
+
+            if (!it) {
+                continue;
+            }
+
+            if (!it.options) {
+                it.options = buildSynthesisOptions(it, data.message);
+            }
+
+            if (it.options.speed == null) it.options.speed = s().speed || 1;
+            if (it.options.vol == null) it.options.vol = s().vol != null ? s().vol : 1;
+            if (it.options.pitch == null) it.options.pitch = s().pitch != null ? s().pitch : 0;
+            if (!it.options.model) it.options.model = s().model;
+            if (!it.options.voiceId) it.options.voiceId = s().voiceId;
+            if (!it.options.audioFormat) it.options.audioFormat = s().audioFormat || 'mp3';
+        }
+    }
+
+    function pushUndo() {
+        undoStack.push(cloneItems(workingItems));
+
+        if (undoStack.length > 50) {
+            undoStack.shift();
+        }
+    }
+
+    function getSpeakers() {
+        var map = {};
+
+        for (var i = 0; i < workingItems.length; i++) {
+            var it = workingItems[i];
+
+            if (!it || it.pauseMs) {
+                continue;
+            }
+
+            var sp = String(it.speaker || '未分类').trim() || '未分类';
+            map[sp] = true;
+        }
+
+        return Object.keys(map);
+    }
+
+    function modelOptionsHtml(value) {
+        var html = '';
+
+        for (var i = 0; i < MODEL_OPTIONS.length; i++) {
+            var o = MODEL_OPTIONS[i];
+            html += '<option value="' + escHtml(o.value) + '"' + (o.value === value ? ' selected' : '') + '>' + escHtml(o.label) + '</option>';
+        }
+
+        return html;
+    }
+
+    function emotionOptionsHtml(value, includeEmpty) {
+        var emotions = ['happy', 'sad', 'angry', 'fearful', 'disgusted', 'surprised', 'neutral'];
+        var html = '';
+
+        if (includeEmpty) {
+            html += '<option value="">不修改</option>';
+        } else {
+            html += '<option value="">默认</option>';
+        }
+
+        for (var i = 0; i < emotions.length; i++) {
+            var e = emotions[i];
+            html += '<option value="' + escHtml(e) + '"' + (e === value ? ' selected' : '') + '>' + escHtml(e) + '</option>';
+        }
+
+        return html;
+    }
+
+    function getVisibleIndexes() {
+        var arr = [];
+
+        for (var i = 0; i < workingItems.length; i++) {
+            var it = workingItems[i];
+
+            if (!it || it.pauseMs) {
+                continue;
+            }
+
+            var sp = String(it.speaker || '未分类').trim() || '未分类';
+
+            if (currentSpeaker === '__ALL__' || currentSpeaker === sp) {
+                arr.push(i);
+            }
+        }
+
+        return arr;
+    }
+
+    function render() {
+        ensureOptions();
+
+        var speakers = getSpeakers();
+        var visibleIndexes = getVisibleIndexes();
+
+        var tabs = '<button class="mm-vp-tab' + (currentSpeaker === '__ALL__' ? ' active' : '') + '" data-speaker="__ALL__">全部</button>';
+
+        for (var ti = 0; ti < speakers.length; ti++) {
+            var sp = speakers[ti];
+            tabs += '<button class="mm-vp-tab' + (currentSpeaker === sp ? ' active' : '') + '" data-speaker="' + escHtml(sp) + '">' + escHtml(sp) + '</button>';
+        }
+
+        var rows = '';
+
+        for (var ri = 0; ri < visibleIndexes.length; ri++) {
+            var idx = visibleIndexes[ri];
+            var it = workingItems[idx];
+
+            if (!it || it.pauseMs) {
+                continue;
+            }
+
+            var opt = it.options || {};
+            var speaker = String(it.speaker || '未分类').trim() || '未分类';
+            var emotion = opt.emotion || '';
+
+            rows += ''
+                + '<div class="mm-vp-row" data-idx="' + idx + '">'
+                + '  <div class="mm-vp-row-top">'
+                + '    <label class="mm-vp-check-wrap"><input type="checkbox" class="mm-vp-check" data-idx="' + idx + '"> <span>#' + (idx + 1) + '</span></label>'
+                + '    <div class="mm-vp-speaker">' + escHtml(speaker) + '</div>'
+                + '    <button class="menu_button mm-vp-preview" data-idx="' + idx + '" title="试听这一句"><i class="fa-solid fa-comment-dots"></i> 试听</button>'
+                + '  </div>'
+                + '  <div class="mm-vp-text">' + escHtml(it.text || '') + '</div>'
+                + '  <div class="mm-vp-grid">'
+                + '    <div class="mm-vp-field"><label>情绪</label><select class="text_pole mm-vp-edit" data-idx="' + idx + '" data-prop="emotion">' + emotionOptionsHtml(emotion, false) + '</select></div>'
+                + '    <div class="mm-vp-field"><label>语速</label><input class="text_pole mm-vp-edit" data-idx="' + idx + '" data-prop="speed" type="number" step="0.1" value="' + escHtml(opt.speed) + '"></div>'
+                + '    <div class="mm-vp-field"><label>音量</label><input class="text_pole mm-vp-edit" data-idx="' + idx + '" data-prop="vol" type="number" step="0.1" value="' + escHtml(opt.vol) + '"></div>'
+                + '    <div class="mm-vp-field"><label>音调</label><input class="text_pole mm-vp-edit" data-idx="' + idx + '" data-prop="pitch" type="number" step="1" min="-12" max="12" value="' + escHtml(opt.pitch) + '"></div>'
+                + '    <div class="mm-vp-field"><label>模型</label><select class="text_pole mm-vp-edit" data-idx="' + idx + '" data-prop="model">' + modelOptionsHtml(opt.model) + '</select></div>'
+                + '    <div class="mm-vp-field"><label>音色</label><input class="text_pole mm-vp-edit" data-idx="' + idx + '" data-prop="voiceId" value="' + escHtml(opt.voiceId || '') + '"></div>'
+                + '  </div>'
+                + '</div>';
+        }
+
+        if (!rows) {
+            rows = '<div class="mm-vp-empty">这个分类下面没有可编辑句子。</div>';
+        }
+
+        var html = ''
+            + '<div id="mm_visual_voice_panel" class="mm-config-mask mm-config-open">'
+            + '  <div class="mm-config-dialog mm-vp-dialog">'
+            + '    <div class="mm-config-header">'
+            + '      <div style="font-weight:700;font-size:1rem;flex:1">可视语音面板 · 当前楼层</div>'
+            + '      <button class="mm-config-close mm-vp-x">×</button>'
+            + '    </div>'
+            + '    <div class="mm-config-body mm-vp-body">'
+            + '      <div class="mm-vp-tabs">' + tabs + '</div>'
+            + '      <div class="mm-vp-bulk">'
+            + '        <label class="mm-vp-select-all"><input type="checkbox" id="mm_vp_select_all"> 当前分类全选</label>'
+            + '        <select class="text_pole" id="mm_vp_bulk_emotion">' + emotionOptionsHtml('', true) + '</select>'
+            + '        <input class="text_pole" id="mm_vp_bulk_speed" type="number" step="0.1" placeholder="语速">'
+            + '        <input class="text_pole" id="mm_vp_bulk_vol" type="number" step="0.1" placeholder="音量">'
+            + '        <input class="text_pole" id="mm_vp_bulk_pitch" type="number" step="1" min="-12" max="12" placeholder="音调 -12 到 12">'
+            + '        <input class="text_pole" id="mm_vp_bulk_voice" placeholder="音色 voiceId">'
+            + '        <button class="menu_button" id="mm_vp_apply_bulk">应用到选中</button>'
+            + '      </div>'
+            + '      <div class="mm-vp-list">' + rows + '</div>'
+            + '    </div>'
+            + '    <div class="mm-vp-footer">'
+            + '      <button class="menu_button" id="mm_vp_undo"><i class="fa-solid fa-rotate-left"></i> 撤回上一步</button>'
+            + '      <div style="flex:1"></div>'
+            + '      <button class="menu_button" id="mm_vp_cancel">取消</button>'
+            + '      <button class="menu_button" id="mm_vp_confirm">确定</button>'
+            + '    </div>'
+            + '  </div>'
+            + '</div>';
+
+        $('#mm_visual_voice_panel').remove();
+        $('body').append(html);
+
+        bindEvents();
+    }
+
+    function bindEvents() {
+        $('#mm_visual_voice_panel .mm-vp-tab').on('click', function () {
+            currentSpeaker = String($(this).data('speaker'));
+            render();
+        });
+
+        $('#mm_visual_voice_panel .mm-vp-x, #mm_vp_cancel').on('click', function () {
+            version.items = cloneItems(originalItems);
+            $('#mm_visual_voice_panel').remove();
+            injectBubbles(id);
+            refreshBubbleStates(id);
+            refreshAllMessageButtons();
+            toastr.warning('已取消修改');
+        });
+
+        $('#mm_vp_confirm').on('click', function () {
+            version.items = cloneItems(workingItems);
+            saveSettingsDebounced();
+            $('#mm_visual_voice_panel').remove();
+            injectBubbles(id);
+            refreshBubbleStates(id);
+            refreshAllMessageButtons();
+            toastr.success('可视面板修改已保存');
+        });
+
+        $('#mm_vp_undo').on('click', function () {
+            if (!undoStack.length) {
+                toastr.warning('没有可撤回的操作');
+                return;
+            }
+
+            workingItems = cloneItems(undoStack.pop());
+            version.items = cloneItems(workingItems);
+            render();
+            toastr.success('已撤回上一步');
+        });
+
+        $('#mm_vp_select_all').on('change', function () {
+            var checked = this.checked;
+            $('#mm_visual_voice_panel .mm-vp-check').prop('checked', checked);
+        });
+
+        $('#mm_visual_voice_panel .mm-vp-edit').on('focus', function () {
+            $(this).data('old-value', $(this).val());
+        });
+
+        $('#mm_visual_voice_panel .mm-vp-edit').on('change', function () {
+            var idx = Number($(this).data('idx'));
+            var prop = String($(this).data('prop'));
+            var val = $(this).val();
+
+            if (!workingItems[idx]) {
+                return;
+            }
+
+            var selected = [];
+
+            $('#mm_visual_voice_panel .mm-vp-check:checked').each(function () {
+                selected.push(Number($(this).data('idx')));
+            });
+
+            // 如果当前正在编辑的这一句也在选中列表里，
+            // 那么把这个值同步给所有选中的句子。
+            // 如果没有选中当前句，就只改当前这一句。
+            var applyIndexes = selected.indexOf(idx) >= 0 ? selected : [idx];
+
+            pushUndo();
+
+            if (prop === 'speed' || prop === 'vol' || prop === 'pitch') {
+                val = Number(val);
+
+                if (!Number.isFinite(val)) {
+                    if (prop === 'speed') val = 1;
+                    if (prop === 'vol') val = 1;
+                    if (prop === 'pitch') val = 0;
+                }
+
+                if (prop === 'pitch') {
+                    if (val > 12) val = 12;
+                    if (val < -12) val = -12;
+                }
+
+                if (prop === 'speed') {
+                    if (val > 2) val = 2;
+                    if (val < 0.5) val = 0.5;
+                }
+
+                if (prop === 'vol') {
+                    if (val > 10) val = 10;
+                    if (val < 0.1) val = 0.1;
+                }
+            }
+
+            for (var i = 0; i < applyIndexes.length; i++) {
+                var targetIdx = applyIndexes[i];
+                var it = workingItems[targetIdx];
+
+                if (!it) {
+                    continue;
+                }
+
+                if (!it.options) {
+                    it.options = buildSynthesisOptions(it, data.message);
+                }
+
+                it.options[prop] = val;
+                it.serverPath = null;
+                delete it.apiLabeled;
+            }
+
+            version.items = cloneItems(workingItems);
+            saveSettingsDebounced();
+
+            if (applyIndexes.length > 1) {
+                toastr.success('已同步到选中的 ' + applyIndexes.length + ' 句');
+                render();
+            }
+        });
+
+        $('#mm_vp_apply_bulk').on('click', function () {
+            var selected = [];
+
+            $('#mm_visual_voice_panel .mm-vp-check:checked').each(function () {
+                selected.push(Number($(this).data('idx')));
+            });
+
+            if (!selected.length) {
+                toastr.warning('请先选择要批量修改的句子');
+                return;
+            }
+
+            var bulkEmotion = $('#mm_vp_bulk_emotion').val();
+            var bulkSpeed = $('#mm_vp_bulk_speed').val();
+            var bulkVol = $('#mm_vp_bulk_vol').val();
+            var bulkPitch = $('#mm_vp_bulk_pitch').val();
+            var bulkVoice = $('#mm_vp_bulk_voice').val();
+
+            if (
+                bulkEmotion === '' &&
+                bulkSpeed === '' &&
+                bulkVol === '' &&
+                bulkPitch === '' &&
+                bulkVoice === ''
+            ) {
+                toastr.warning('请至少填写一个批量参数');
+                return;
+            }
+
+            pushUndo();
+
+            for (var i = 0; i < selected.length; i++) {
+                var idx = selected[i];
+                var it = workingItems[idx];
+
+                if (!it) {
+                    continue;
+                }
+
+                if (!it.options) {
+                    it.options = buildSynthesisOptions(it, data.message);
+                }
+
+                if (bulkEmotion !== '') it.options.emotion = bulkEmotion;
+
+                if (bulkSpeed !== '') {
+                    var nSpeed = Number(bulkSpeed);
+                    if (!Number.isFinite(nSpeed)) nSpeed = 1;
+                    if (nSpeed > 2) nSpeed = 2;
+                    if (nSpeed < 0.5) nSpeed = 0.5;
+                    it.options.speed = nSpeed;
+                }
+
+                if (bulkVol !== '') {
+                    var nVol = Number(bulkVol);
+                    if (!Number.isFinite(nVol)) nVol = 1;
+                    if (nVol > 10) nVol = 10;
+                    if (nVol < 0.1) nVol = 0.1;
+                    it.options.vol = nVol;
+                }
+
+                if (bulkPitch !== '') {
+                    var nPitch = Number(bulkPitch);
+                    if (!Number.isFinite(nPitch)) nPitch = 0;
+                    if (nPitch > 12) nPitch = 12;
+                    if (nPitch < -12) nPitch = -12;
+                    it.options.pitch = nPitch;
+                }
+
+                if (bulkVoice !== '') it.options.voiceId = bulkVoice;
+
+                it.serverPath = null;
+                delete it.apiLabeled;
+            }
+
+            version.items = cloneItems(workingItems);
+            saveSettingsDebounced();
+            render();
+            toastr.success('已批量应用到选中句子');
+        });
+
+        $('#mm_visual_voice_panel .mm-vp-preview').on('click', async function () {
+            var idx = Number($(this).data('idx'));
+            var it = workingItems[idx];
+
+            if (!it || !it.text) {
+                toastr.warning('这一句没有文本');
+                return;
+            }
+
+            try {
+                $(this).prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> 生成中');
+
+                if (!it.options) {
+                    it.options = buildSynthesisOptions(it, data.message);
+                }
+
+                var result = await getAudioBlob(it);
+
+                activeAudio.pause();
+                activeAudio.src = '';
+
+                if (result && result._audioUrl) {
+                    activeAudio.src = result._audioUrl;
+                    await activeAudio.play();
+                } else {
+                    var url = URL.createObjectURL(result);
+                    activeAudio.src = url;
+                    activeAudio.onended = function () {
+                        URL.revokeObjectURL(url);
+                    };
+                    activeAudio.onerror = function () {
+                        URL.revokeObjectURL(url);
+                    };
+                    await activeAudio.play();
+                }
+
+                version.items = cloneItems(workingItems);
+                saveSettingsDebounced();
+            } catch (err) {
+                console.error('[MiniMax TTS] 试听失败', err);
+                toastr.error('试听失败：' + (err.message || err));
+            } finally {
+                var btn = $('#mm_visual_voice_panel .mm-vp-preview[data-idx="' + idx + '"]');
+                btn.prop('disabled', false).html('<i class="fa-solid fa-comment-dots"></i> 试听');
+            }
+        });
+    }
+
+    ensureOptions();
+    render();
+}
+
+function getFavoriteAudioKey(item) {
+    if (!item) {
+        return '';
+    }
+
+    return 'fav_' + simpleHash(item.text || '') + '_' + simpleHash(JSON.stringify(item.options || {}));
+}
+
+function isFavoriteAudioItem(item) {
+    var key = getFavoriteAudioKey(item);
+    var list = s().favoriteAudios || [];
+
+    for (var i = 0; i < list.length; i++) {
+        if (list[i] && list[i].key === key) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+async function favoriteBubbleAudio(mesid, segidx) {
+    var data = getMessageData(mesid);
+    var h = s().serverHistory[data.key];
+
+    if (!h || !h.versions || !h.versions[h.activeIndex]) {
+        toastr.warning('当前气泡没有可收藏的缓存数据');
+        return;
+    }
+
+    var item = h.versions[h.activeIndex].items[segidx];
+
+    if (!item || !item.text) {
+        toastr.warning('这个气泡没有文本');
+        return;
+    }
+
+    if (!s().favoriteAudios) {
+        s().favoriteAudios = [];
+    }
+
+    var favKey = getFavoriteAudioKey(item);
+
+    for (var i = 0; i < s().favoriteAudios.length; i++) {
+        if (s().favoriteAudios[i] && s().favoriteAudios[i].key === favKey) {
+            toastr.info('这个音频已经在收藏里了');
+            return;
+        }
+    }
+
+    toastr.info('正在收藏音频...');
+
+    try {
+        var blob = await getAudioBlob(item);
+        var savedPath = item.serverPath || '';
+        var savedUrl = '';
+
+        if (blob instanceof Blob) {
+            var fmt = item.options && item.options.audioFormat ? item.options.audioFormat : 'mp3';
+            var up = await uploadToSTServer(blob, favKey + '.' + fmt);
+
+            if (up) {
+                savedPath = up;
+            }
+        } else if (blob && blob._audioUrl) {
+            savedUrl = blob._audioUrl;
+
+            // 如果可以跨域读取，就尝试再上传一份到本地文件，避免外链失效
+            try {
+                var rr = await fetch(blob._audioUrl);
+                if (rr.ok) {
+                    var remoteBlob = await rr.blob();
+                    var fmt2 = item.options && item.options.audioFormat ? item.options.audioFormat : 'mp3';
+                    var up2 = await uploadToSTServer(remoteBlob, favKey + '.' + fmt2);
+
+                    if (up2) {
+                        savedPath = up2;
+                        savedUrl = '';
+                    }
+                }
+            } catch (_) {}
+        }
+
+        if (!savedPath && !savedUrl) {
+            toastr.error('收藏失败：没有拿到可保存的音频');
+            return;
+        }
+
+        var fav = {
+            key: favKey,
+            text: item.text || '',
+            speaker: item.speaker || '',
+            emotion: item.options && item.options.emotion ? item.options.emotion : '',
+            voiceId: item.options && item.options.voiceId ? item.options.voiceId : '',
+            model: item.options && item.options.model ? item.options.model : '',
+            options: JSON.parse(JSON.stringify(item.options || {})),
+            serverPath: savedPath,
+            audioUrl: savedUrl,
+            createdAt: Date.now(),
+        };
+
+        s().favoriteAudios.unshift(fav);
+        saveSettingsDebounced();
+
+        injectBubbles(mesid);
+        toastr.success('已收藏这个音频，清理缓存也不会丢');
+    } catch (e) {
+        console.error('[MiniMax TTS] 收藏失败', e);
+        toastr.error('收藏失败：' + (e.message || e));
+    }
+}
+
+function openFavoriteAudioPanel() {
+    if (!s().favoriteAudios) {
+        s().favoriteAudios = [];
+    }
+
+    var list = s().favoriteAudios || [];
+    var rows = '';
+
+    for (var i = 0; i < list.length; i++) {
+        var fav = list[i];
+
+        if (!fav) {
+            continue;
+        }
+
+        var date = fav.createdAt ? new Date(fav.createdAt).toLocaleString() : '';
+
+        rows += ''
+            + '<div class="mm-fav-row" data-idx="' + i + '">'
+            + '  <div class="mm-fav-top">'
+            + '    <div class="mm-fav-title"><i class="fa-solid fa-star"></i> ' + escHtml(fav.speaker || '未分类') + '</div>'
+            + '    <div class="mm-fav-date">' + escHtml(date) + '</div>'
+            + '  </div>'
+            + '  <div class="mm-fav-text">' + escHtml(fav.text || '') + '</div>'
+            + '  <div class="mm-fav-meta">'
+            + '    <span>情绪：' + escHtml(fav.emotion || '默认') + '</span>'
+            + '    <span>音色：' + escHtml(fav.voiceId || '') + '</span>'
+            + '    <span>模型：' + escHtml(fav.model || '') + '</span>'
+            + '  </div>'
+            + '  <div class="mm-fav-actions">'
+            + '    <button class="menu_button mm-fav-play" data-idx="' + i + '"><i class="fa-solid fa-play"></i> 试听</button>'
+            + '    <button class="menu_button mm-fav-copy" data-idx="' + i + '"><i class="fa-solid fa-copy"></i> 复制参数</button>'
+            + '    <button class="menu_button mm-fav-del" data-idx="' + i + '" style="color:#ef5350"><i class="fa-solid fa-trash"></i> 删除</button>'
+            + '  </div>'
+            + '</div>';
+    }
+
+    if (!rows) {
+        rows = '<div class="mm-fav-empty">还没有收藏音频。长按语音气泡可以收藏。</div>';
+    }
+
+    var html = ''
+        + '<div id="mm_favorite_audio_panel" class="mm-config-mask mm-config-open">'
+        + '  <div class="mm-config-dialog mm-fav-dialog">'
+        + '    <div class="mm-config-header">'
+        + '      <div style="font-weight:700;font-size:1rem;flex:1"><i class="fa-solid fa-star"></i> 我的收藏</div>'
+        + '      <button class="mm-config-close mm-fav-close">×</button>'
+        + '    </div>'
+        + '    <div class="mm-config-body mm-fav-body">'
+        + rows
+        + '    </div>'
+        + '  </div>'
+        + '</div>';
+
+    $('#mm_favorite_audio_panel').remove();
+    $('body').append(html);
+
+    $('#mm_favorite_audio_panel .mm-fav-close').on('click', function () {
+        $('#mm_favorite_audio_panel').remove();
+    });
+
+    $('#mm_favorite_audio_panel .mm-fav-play').on('click', async function () {
+        var idx = Number($(this).data('idx'));
+        var fav = s().favoriteAudios[idx];
+
+        if (!fav) {
+            return;
+        }
+
+        try {
+            activeAudio.pause();
+            activeAudio.src = '';
+
+            if (fav.serverPath) {
+                activeAudio.src = fav.serverPath;
+            } else if (fav.audioUrl) {
+                activeAudio.src = fav.audioUrl;
+            } else {
+                toastr.warning('这个收藏没有可播放地址');
+                return;
+            }
+
+            await activeAudio.play();
+        } catch (e) {
+            toastr.error('播放失败：' + (e.message || e));
+        }
+    });
+
+    $('#mm_favorite_audio_panel .mm-fav-copy').on('click', function () {
+        var idx = Number($(this).data('idx'));
+        var fav = s().favoriteAudios[idx];
+
+        if (!fav) {
+            return;
+        }
+
+        var text = JSON.stringify({
+            text: fav.text,
+            speaker: fav.speaker,
+            emotion: fav.emotion,
+            voiceId: fav.voiceId,
+            model: fav.model,
+            options: fav.options,
+        }, null, 2);
+
+        navigator.clipboard.writeText(text).then(function () {
+            toastr.success('已复制收藏参数');
+        }).catch(function () {
+            toastr.warning('复制失败');
+        });
+    });
+
+    $('#mm_favorite_audio_panel .mm-fav-del').on('click', function () {
+        var idx = Number($(this).data('idx'));
+
+        if (!confirm('确定删除这个收藏吗？')) {
+            return;
+        }
+
+        s().favoriteAudios.splice(idx, 1);
+        saveSettingsDebounced();
+        $('#mm_favorite_audio_panel').remove();
+        openFavoriteAudioPanel();
+        refreshAllBubbles();
+        toastr.success('已删除收藏');
+    });
+}
 
 function openParamsEditor(id) {
     var data = getMessageData(id);
@@ -3109,10 +3770,289 @@ st.textContent += `
     }
 }
 `;
+st.textContent += `
+#mm_visual_voice_panel {
+    z-index: 2147483003 !important;
+}
+
+.mm-vp-dialog {
+    width: min(980px, 96vw) !important;
+    max-height: 92vh !important;
+    background: var(--SmartThemeBlurTintColor, #1a1c2a) !important;
+    color: var(--SmartThemeBodyColor, #ccc) !important;
+}
+
+.mm-vp-body {
+    padding: 12px !important;
+}
+
+.mm-vp-tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    padding-bottom: 8px;
+}
+
+.mm-vp-tab {
+    border: none;
+    border-radius: 999px;
+    padding: 6px 12px;
+    background: rgba(255,255,255,.08);
+    color: inherit;
+    cursor: pointer;
+    opacity: .72;
+    font-size: .86rem;
+}
+
+.mm-vp-tab:hover {
+    opacity: 1;
+    background: rgba(255,255,255,.14);
+}
+
+.mm-vp-tab.active {
+    opacity: 1;
+    background: rgba(255,255,255,.2);
+    font-weight: 700;
+}
+
+.mm-vp-bulk {
+    display: grid;
+    grid-template-columns: 130px repeat(5, minmax(80px, 1fr)) 110px;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 12px;
+    padding: 10px;
+    border-radius: 12px;
+    background: rgba(0,0,0,.16);
+}
+
+.mm-vp-select-all {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: .84rem;
+    opacity: .9;
+    white-space: nowrap;
+}
+
+.mm-vp-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mm-vp-row {
+    border-radius: 14px;
+    background: rgba(255,255,255,.055);
+    padding: 10px;
+    border: 1px solid rgba(255,255,255,.07);
+}
+
+.mm-vp-row-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.mm-vp-check-wrap {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: .82rem;
+    opacity: .85;
+}
+
+.mm-vp-speaker {
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,.1);
+    font-size: .78rem;
+    opacity: .9;
+}
+
+.mm-vp-preview {
+    margin-left: auto;
+    min-width: 76px;
+    height: 30px !important;
+    font-size: .8rem !important;
+}
+
+.mm-vp-text {
+    font-size: .88rem;
+    line-height: 1.45;
+    opacity: .92;
+    padding: 8px;
+    margin-bottom: 10px;
+    border-radius: 10px;
+    background: rgba(0,0,0,.18);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.mm-vp-grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(80px, 1fr));
+    gap: 8px;
+}
+
+.mm-vp-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.mm-vp-field label {
+    font-size: .75rem;
+    opacity: .65;
+}
+
+.mm-vp-field .text_pole {
+    width: 100%;
+    height: 30px !important;
+    font-size: .8rem !important;
+    box-sizing: border-box;
+}
+
+.mm-vp-footer {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid rgba(255,255,255,.08);
+    background: rgba(0,0,0,.12);
+}
+
+.mm-vp-empty {
+    opacity: .65;
+    text-align: center;
+    padding: 30px 10px;
+}
+
+@media screen and (max-width: 700px) {
+    .mm-vp-dialog {
+        width: 94vw !important;
+        max-width: 94vw !important;
+        height: 86dvh !important;
+        max-height: 86dvh !important;
+    }
+
+    .mm-vp-bulk {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .mm-vp-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .mm-vp-preview {
+        min-width: 64px;
+        padding-left: 8px !important;
+        padding-right: 8px !important;
+    }
+}
+`;
+    st.textContent += `
+.mm-bubble.mm-bubble-favorite {
+    background: rgba(255, 215, 90, 0.95) !important;
+    border-color: rgba(255, 188, 40, 1) !important;
+    color: #5a3b00 !important;
+    box-shadow: 0 0 0 1px rgba(255, 215, 90, .35), 0 2px 8px rgba(0,0,0,.18) !important;
+}
+
+.mm-bubble.mm-bubble-favorite i {
+    color: #7a4d00 !important;
+}
+
+.mm-bubble.mm-bubble-fav-saving {
+    opacity: .7 !important;
+    transform: scale(.96) !important;
+}
+
+.mm-fav-dialog {
+    width: min(760px, 96vw) !important;
+    max-height: 90vh !important;
+}
+
+.mm-fav-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mm-fav-row {
+    border-radius: 14px;
+    padding: 10px;
+    background: rgba(255,255,255,.055);
+    border: 1px solid rgba(255,255,255,.08);
+}
+
+.mm-fav-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.mm-fav-title {
+    font-weight: 700;
+    flex: 1;
+}
+
+.mm-fav-title i {
+    color: #ffd45a;
+}
+
+.mm-fav-date {
+    font-size: .75rem;
+    opacity: .55;
+}
+
+.mm-fav-text {
+    padding: 8px;
+    border-radius: 10px;
+    background: rgba(0,0,0,.18);
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: .88rem;
+    line-height: 1.45;
+    margin-bottom: 8px;
+}
+
+.mm-fav-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.mm-fav-meta span {
+    font-size: .75rem;
+    opacity: .75;
+    padding: 3px 7px;
+    border-radius: 999px;
+    background: rgba(255,255,255,.08);
+}
+
+.mm-fav-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.mm-fav-empty {
+    text-align: center;
+    opacity: .65;
+    padding: 40px 10px;
+}
+`;
+
 
     document.head.appendChild(st);
 
 }
+
 
 function renderVoiceLibrary() {
     var c = document.getElementById('mm_voice_lib_rows'); if (!c) return; c.innerHTML = '';
@@ -4119,6 +5059,17 @@ function openConfigPanel() {
     setTimeout(function () {
         applyMobileConfigPanelLayout();
     }, 500);
+
+    var mask = document.getElementById('mm-config-mask');
+
+    if (mask) {
+        mask.classList.add('mm-config-open');
+        populateConfigFields();
+        applyMobileConfigPanelLayout();
+        setTimeout(applyMobileConfigPanelLayout, 50);
+        setTimeout(applyMobileConfigPanelLayout, 250);
+    }
+    
 }
 
 
@@ -4129,10 +5080,22 @@ function openConfigPanel() {
 
 function createUi() {
     if (window._mmtts_ui_created) return;
-    window._mmtts_ui_created = true;
     injectStyles();
+    loadSettings();
+
+    var extMenu = document.getElementById('extensionsMenu');
+
+    if (!extMenu) {
+        console.warn('[MiniMax TTS] #extensionsMenu 未找到，稍后重试创建入口');
+        setTimeout(createUi, 1000);
+        return;
+    }
+
+    window._mmtts_ui_created = true;
+
     if (!document.getElementById('mm_wand_item')) {
-        $('#extensionsMenu').append(
+        extMenu.insertAdjacentHTML(
+            'beforeend',
             '<div id="mm_wand_item" class="list-group-item flex-container flexGap5" title="MiniMax TTS">'
             + '<div class="fa-solid fa-volume-high extensionsMenuExtensionButton"></div>MiniMax语音</div>'
         );
@@ -4158,7 +5121,7 @@ function createUi() {
 
 
 
-    $('#mm_wand_item').on('click', function () {
+    $('#mm_wand_item').off('click.mmtts').on('click.mmtts', function () {
         var m = document.getElementById('extensionsMenu');
         if (m) m.style.display = 'none';
         openConfigPanel();
@@ -4172,6 +5135,13 @@ function createUi() {
         + '<div class="mm-fab" id="mm_fab" title="打开语音操作菜单">'
         + '<i class="fa-solid fa-headphones"></i>'
         + '</div></div>';
+    if (!document.body) {
+        console.warn('[MiniMax TTS] document.body 未准备好，稍后重试创建UI');
+        window._mmtts_ui_created = false;
+        setTimeout(createUi, 1000);
+        return;
+    }
+
     document.body.insertAdjacentHTML('beforeend', fabHtml);
 
     var mmFabWrap = document.getElementById('mm_fab_wrap');
@@ -4293,6 +5263,11 @@ function createUi() {
 
     var fabWrap = document.getElementById('mm_fab_wrap');
     var fabBtn = document.getElementById('mm_fab');
+
+    if (!fabWrap || !fabBtn) {
+        console.error('[MiniMax TTS] 悬浮按钮创建失败');
+        return;
+    }
 
     fabBtn.addEventListener('pointerdown', function (e) {
         if (e.button !== undefined && e.button !== 0) return;
@@ -4485,9 +5460,49 @@ jQuery(async function () {
         }, 30);
     });
 
+    // 长按气泡收藏音频
+    $(document).on('mousedown touchstart', '.mm-bubble', function (e) {
+        var $b = $(this);
+        var mesid = Number($b.data('mesid'));
+        var segidx = Number($b.data('segidx'));
+
+        if (mmInlineEditState && Number(mmInlineEditState.mesid) === mesid) {
+            return;
+        }
+
+        clearTimeout(mmBubbleLongPressTimer);
+        mmBubbleLongPressFired = false;
+
+        mmBubbleLongPressTimer = setTimeout(async function () {
+            mmBubbleLongPressFired = true;
+            $b.addClass('mm-bubble-fav-saving');
+
+            try {
+                await favoriteBubbleAudio(mesid, segidx);
+            } finally {
+                $b.removeClass('mm-bubble-fav-saving');
+            }
+        }, 700);
+    });
+
+    $(document).on('mouseup mouseleave touchend touchcancel', '.mm-bubble', function () {
+        clearTimeout(mmBubbleLongPressTimer);
+    });
+
 
     // 气泡点击播放 / 编辑模式点击删除
     $(document).on('click', '.mm-bubble', async function (e) {
+        if (mmBubbleLongPressFired) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            setTimeout(function () {
+                mmBubbleLongPressFired = false;
+            }, 50);
+
+            return false;
+        }
+
         var $b = $(this);
         var mesid = Number($b.data('mesid'));
         var segidx = Number($b.data('segidx'));
