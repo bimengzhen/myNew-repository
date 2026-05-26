@@ -2,6 +2,7 @@ import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } fr
 import { extension_settings, getContext } from '../../../extensions.js';
 
 
+
 const MODULE_NAME = 'minimax_quote_tts';
 const PROXY_ENDPOINT = '/api/minimax/generate-voice';
 const DEFAULT_API_HOST = 'https://api.minimax.chat';
@@ -41,6 +42,7 @@ const defaults = {
     defaultMaleModel: '', defaultFemaleModel: '',
     autoClearInterval: 4, _messageCounter: 0,
     showFloatingBtn: true, floatingBtnImg: '',
+    floatingBtnBorderColor: '#d9c2ff',
     floatingBtnX: null, floatingBtnY: null,
 };
 
@@ -50,6 +52,7 @@ const localAudioCache = new Map();
 let mmInlineEditState = null;
 let mmBubbleLongPressTimer = null;
 let mmBubbleLongPressFired = false;
+
 
 
 function s() { return extension_settings[MODULE_NAME]; }
@@ -143,9 +146,13 @@ function loadSettings() {
     }
     delete st.quoteOnly; delete st.regexMode; delete st.customRegexPattern; delete st.customRegexFlags;
     if (!st._bubbleFixV4) {
-        st.serverHistory = {};
+        if (!st.serverHistory || typeof st.serverHistory !== 'object') {
+            st.serverHistory = {};
+        }
+
         st._bubbleFixV4 = true;
     }
+
     st._loaded = true;
 }
 
@@ -260,7 +267,7 @@ async function extractAudioFromResponse(d, fmt) {
 
 
 
-async function pollTaskResult(baseUrl, headers, taskId) {
+async function pollTaskResult(baseUrl, headers, taskId, fmt) {
     const MAX = 60, INT = 2000;
     const urls = [
         baseUrl + '/' + taskId,
@@ -303,11 +310,11 @@ async function pollTaskResult(baseUrl, headers, taskId) {
                 }
 
                 if (['completed', 'done', 'success', 'finished'].includes(st)) {
-                    return await extractAudioFromResponse(d, 'mp3');
+                    return await extractAudioFromResponse(d, fmt || 'mp3');
                 }
 
                 if (getAudioFieldFromResponse(d)) {
-                    return await extractAudioFromResponse(d, 'mp3');
+                    return await extractAudioFromResponse(d, fmt || 'mp3');
                 }
 
                 if (i === 0) {
@@ -433,7 +440,7 @@ async function directMinimaxTts(text, options) {
     const taskId = data.task_id || data.data?.task_id || data.id || data.data?.id;
     if (taskId && !getAudioFieldFromResponse(data)) {
         console.log('[MiniMax TTS] 异步任务:', taskId);
-        return await pollTaskResult(url, headers, taskId);
+        return await pollTaskResult(url, headers, taskId, fmt);
     }
 
     return await extractAudioFromResponse(data, fmt);
@@ -631,6 +638,57 @@ function applyPreProcessRules(text) {
     return text.trim();
 }
 
+function prepareTextAndRulesForRegex(text) {
+    text = String(text || '');
+
+    var preRules = (s().llmPreProcessRules || []).filter(function (r) {
+        return r && r.enabled && r.pattern;
+    });
+
+    var normalRules = (s().regexRules || []).filter(function (r) {
+        return r && r.enabled && r.pattern;
+    });
+
+    var cleanText = text;
+    var extraExtractRules = [];
+
+    for (var i = 0; i < preRules.length; i++) {
+        var rule = preRules[i];
+
+        if (rule.mode === 'extract') {
+            extraExtractRules.push({
+                id: rule.id || ('pre-extract-' + i),
+                enabled: true,
+                name: '[预处理] ' + (rule.name || '提取规则'),
+                pattern: rule.pattern,
+                flags: rule.flags || 'g',
+                mode: 'extract',
+            });
+            continue;
+        }
+
+        var re;
+        try {
+            var fl = normalizeRegexFlags(rule.flags, true);
+            re = new RegExp(parsePattern(rule.pattern), fl);
+        } catch (e) {
+            console.warn('[MiniMax TTS] 预处理排除规则编译失败:', rule.name, e);
+            continue;
+        }
+
+        var before = cleanText.length;
+        cleanText = cleanText.replace(re, '');
+        if (before !== cleanText.length) {
+            ttsLog('预处理排除 [' + (rule.name || '?') + ']: ' + before + '字 → ' + cleanText.length + '字');
+        }
+    }
+
+    return {
+        text: cleanText.trim(),
+        rules: normalRules.concat(extraExtractRules),
+    };
+}
+
 
 async function formatWithSecondaryApi(m, cachedItemsForLabeling) {
     ttsLog('=== 副LLM分析开始 ===');
@@ -663,11 +721,24 @@ async function formatWithSecondaryApi(m, cachedItemsForLabeling) {
 
         ttsLog('使用已有气泡缓存进行API标注: ' + preExtracted.length + ' 个片段', 'success');
     } else {
-        // 没有缓存时，才从原文/预处理文本里提取
-        preExtracted = extractForLlmLabeling(m.mes || '');
+        // 没有缓存时，先按统一的预处理 + 正则流程提取
+        var preparedForRegex = prepareTextAndRulesForRegex(m.mes || '');
+        var regexExtracted = preparedForRegex.rules.length
+            ? runRegexExtraction(preparedForRegex.text, preparedForRegex.rules, m.name)
+            : [];
+
+        preExtracted = regexExtracted.map(function (seg, idx) {
+            return {
+                idx: idx,
+                text: seg.text || '',
+                fullMatch: seg.fullMatch || seg.text || '',
+                type: 'regex',
+                pos: seg.pos || idx,
+            };
+        });
 
         if (!preExtracted.length) {
-            preExtracted = extractForLlmLabeling(inputText);
+            preExtracted = extractForLlmLabeling(preparedForRegex.text);
         }
 
         ttsLog('无已有气泡缓存，尝试正则预提取: ' + preExtracted.length + ' 个片段', preExtracted.length ? 'success' : 'warn');
@@ -1027,7 +1098,12 @@ function runRegexExtraction(cleanText, rules, speaker) {
 
         extracted = extracted.filter(function (seg) {
             re.lastIndex = 0;
-            return !re.test(seg.text);
+            var hitText = re.test(seg.text || '');
+
+            re.lastIndex = 0;
+            var hitFull = re.test(seg.fullMatch || '');
+
+            return !hitText && !hitFull;
         });
     }
 
@@ -1142,8 +1218,8 @@ async function generateMessageSpeech(id, forced) {
             console.log('[MiniMax TTS] LLM返回:', JSON.stringify(raw).slice(0, 500));
         } else {
             var ct = s().ignoreCodeBlocks ? message.mes.replace(/```[\s\S]*?```/g, ' ') : message.mes;
-            var rules = (s().regexRules || []).filter(function (r) { return r.enabled; });
-            raw = rules.length ? runRegexExtraction(ct, rules, message.name) : [];
+            var prepared = prepareTextAndRulesForRegex(ct);
+            raw = prepared.rules.length ? runRegexExtraction(prepared.text, prepared.rules, message.name) : [];
         }
 
         if (!raw || !raw.length) {
@@ -1295,9 +1371,10 @@ function extractSegmentsOnly(id) {
     // 酒馆斜体/Markdown 可能会渲染成 HTML，这里不能直接跳过
     // if (isHtmlMessage(message.mes)) return false;    
     var ct = s().ignoreCodeBlocks ? message.mes.replace(/```[\s\S]*?```/g, ' ') : message.mes;
-    var rules = (s().regexRules || []).filter(function (r) { return r.enabled; });
+    var prepared = prepareTextAndRulesForRegex(ct);
+    var rules = prepared.rules;
     if (!rules.length) return false;
-    var extracted = runRegexExtraction(ct, rules, message.name);
+    var extracted = runRegexExtraction(prepared.text, rules, message.name);
     if (!extracted.length) return false;
     var items = extracted.map(function (seg) {
         return {
@@ -1733,6 +1810,13 @@ function cloneItems(items) {
     return JSON.parse(JSON.stringify(items || []));
 }
 
+function isMobileLikeDevice() {
+    return window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+
+
+
 function pushInlineEditUndo() {
     if (!mmInlineEditState) {
         return;
@@ -1771,6 +1855,9 @@ function undoInlineBubbleEdit() {
 }
 
 function openInlineBubbleEditor(mesid) {
+    $('#mm_visual_voice_panel').remove();
+    $('#mm_favorite_audio_panel').remove();
+
     console.log('[MiniMax TTS] 打开行内气泡编辑器 mesid=' + mesid);
 
     var data = getMessageData(mesid);
@@ -1842,7 +1929,39 @@ function openInlineBubbleEditor(mesid) {
     injectBubbles(mesid);
     saveSettingsDebounced();
 
-    toastr.info('已进入气泡编辑模式：选中文字即可添加气泡，点击气泡可删除');
+    function _mmForceShowInlineButtons() {
+        var bar = document.getElementById('mm_inline_editor_bar');
+        var isMobileLike = window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
+        if (bar) {
+            bar.style.setProperty('display', 'block', 'important');
+            bar.style.setProperty('visibility', 'visible', 'important');
+            bar.style.setProperty('opacity', '1', 'important');
+            bar.style.setProperty('pointer-events', isMobileLike ? 'auto' : 'none', 'important');
+            bar.style.setProperty('z-index', '2147483646', 'important');
+
+            if (isMobileLike) {
+                bar.style.setProperty('top', 'calc(env(safe-area-inset-top, 0px) + 8px)', 'important');
+                bar.style.setProperty('bottom', 'auto', 'important');
+                bar.style.setProperty('width', 'calc(100vw - 18px)', 'important');
+                bar.style.setProperty('max-width', 'calc(100vw - 18px)', 'important');
+            }
+        }
+    }
+    setTimeout(_mmForceShowInlineButtons, 80);
+    setTimeout(_mmForceShowInlineButtons, 300);
+    setTimeout(_mmForceShowInlineButtons, 800);
+
+
+
+
+
+
+    if (isMobileLikeDevice()) {
+        toastr.info('编辑模式：选中文字添加，点气泡删除。顶部按钮可撤回/确定/取消');
+    } else {
+        toastr.info('已进入气泡编辑模式：选中文字即可添加气泡，点击气泡可删除');
+    }
 }
 
 
@@ -1874,6 +1993,14 @@ function closeInlineBubbleEditor(save) {
         bar.remove();
     }
 
+    ['mm_inline_top_undo', 'mm_inline_top_save', 'mm_inline_top_cancel'].forEach(function (id) {
+        var el = document.getElementById(id);
+
+        if (el) {
+            el.remove();
+        }
+    });
+
     injectBubbles(mesid);
     refreshBubbleStates(mesid);
     refreshAllMessageButtons();
@@ -1886,28 +2013,126 @@ function showInlineEditorBar(mesid) {
         old.remove();
     }
 
+    ['mm_inline_top_undo', 'mm_inline_top_save', 'mm_inline_top_cancel'].forEach(function (id) {
+        var el = document.getElementById(id);
+
+        if (el) {
+            el.remove();
+        }
+    });
+
+    var isMobileLike = window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
     var bar = document.createElement('div');
     bar.id = 'mm_inline_editor_bar';
-    bar.innerHTML = ''
-        + '<div class="mm-inline-editor-title">气泡编辑模式：选中文字添加气泡，点击气泡删除</div>'
-        + '<button class="mm-inline-editor-undo">撤回</button>'
-        + '<button class="mm-inline-editor-save">保存</button>'
-        + '<button class="mm-inline-editor-cancel">取消</button>';
+
+    if (isMobileLike) {
+        bar.innerHTML = ''
+            + '<div style="display:flex;align-items:center;justify-content:center;gap:6px;width:100%;box-sizing:border-box;">'
+            + '<span style="flex:1;min-width:0;text-align:left;font-size:12px;line-height:1.25;">气泡编辑：选中文字添加，点气泡删除</span>'
+            + '<button id="mm_inline_top_undo" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:rgba(60,60,70,.98);color:#fff;font-weight:900;font-size:13px;padding:0;margin:0;">撤回</button>'
+            + '<button id="mm_inline_top_save" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:#f4ead8;color:#5a341e;font-weight:900;font-size:13px;padding:0;margin:0;">确定</button>'
+            + '<button id="mm_inline_top_cancel" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:rgba(120,55,55,.98);color:#fff;font-weight:900;font-size:13px;padding:0;margin:0;">取消</button>'
+            + '</div>';
+    } else {
+        bar.textContent = '气泡编辑模式：选中文字添加气泡，点击气泡删除';
+    }
 
     document.body.appendChild(bar);
 
-    bar.querySelector('.mm-inline-editor-undo').addEventListener('click', function () {
-        undoInlineBubbleEdit();
-    });
+    bar.style.setProperty('position', 'fixed', 'important');
+    bar.style.setProperty('left', '50%', 'important');
+    bar.style.setProperty('transform', 'translateX(-50%)', 'important');
+    bar.style.setProperty('z-index', '2147483646', 'important');
+    bar.style.setProperty('display', 'block', 'important');
+    bar.style.setProperty('visibility', 'visible', 'important');
+    bar.style.setProperty('opacity', '1', 'important');
+    bar.style.setProperty('pointer-events', isMobileLike ? 'auto' : 'none', 'important');
+    bar.style.setProperty('box-sizing', 'border-box', 'important');
+    bar.style.setProperty('background', 'rgba(42, 32, 24, 0.94)', 'important');
+    bar.style.setProperty('color', '#fff7e8', 'important');
+    bar.style.setProperty('box-shadow', '0 8px 30px rgba(0,0,0,.45)', 'important');
+    bar.style.setProperty('border', '1px solid rgba(255,255,255,.16)', 'important');
+    bar.style.setProperty('text-align', 'center', 'important');
+    bar.style.setProperty('white-space', 'normal', 'important');
+    bar.style.setProperty('overflow', 'hidden', 'important');
 
-    bar.querySelector('.mm-inline-editor-save').addEventListener('click', function () {
-        closeInlineBubbleEditor(true);
-    });
+    if (isMobileLike) {
+        bar.style.setProperty('top', 'calc(env(safe-area-inset-top, 0px) + 8px)', 'important');
+        bar.style.setProperty('bottom', 'auto', 'important');
+        bar.style.setProperty('width', 'calc(100vw - 18px)', 'important');
+        bar.style.setProperty('max-width', 'calc(100vw - 18px)', 'important');
+        bar.style.setProperty('padding', '7px 8px', 'important');
+        bar.style.setProperty('border-radius', '12px', 'important');
+        bar.style.setProperty('font-size', '12px', 'important');
+        bar.style.setProperty('line-height', '1.25', 'important');
 
-    bar.querySelector('.mm-inline-editor-cancel').addEventListener('click', function () {
-        closeInlineBubbleEditor(false);
-    });
+        var topUndoBtn = document.getElementById('mm_inline_top_undo');
+        var topSaveBtn = document.getElementById('mm_inline_top_save');
+        var topCancelBtn = document.getElementById('mm_inline_top_cancel');
+
+        function bindInlineTopBtn(btn, fn) {
+            if (!btn) {
+                return;
+            }
+
+            var fired = false;
+
+            function run(e) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                if (e.stopImmediatePropagation) {
+                    e.stopImmediatePropagation();
+                }
+
+                if (fired) {
+                    return false;
+                }
+
+                fired = true;
+
+                setTimeout(function () {
+                    fired = false;
+                }, 180);
+
+                fn();
+                return false;
+            }
+
+            if (window.PointerEvent) {
+                btn.addEventListener('pointerup', run, true);
+            } else {
+                btn.addEventListener('touchend', run, true);
+                btn.addEventListener('click', run, true);
+            }
+        }
+
+        bindInlineTopBtn(topUndoBtn, function () {
+            undoInlineBubbleEdit();
+        });
+
+        bindInlineTopBtn(topSaveBtn, function () {
+            closeInlineBubbleEditor(true);
+        });
+
+        bindInlineTopBtn(topCancelBtn, function () {
+            closeInlineBubbleEditor(false);
+        });
+    } else {
+        bar.style.setProperty('top', 'auto', 'important');
+        bar.style.setProperty('bottom', '24px', 'important');
+        bar.style.setProperty('width', '420px', 'important');
+        bar.style.setProperty('max-width', 'calc(100vw - 24px)', 'important');
+        bar.style.setProperty('padding', '10px 12px', 'important');
+        bar.style.setProperty('border-radius', '16px', 'important');
+        bar.style.setProperty('font-size', '13px', 'important');
+        bar.style.setProperty('line-height', '1.3', 'important');
+    }
 }
+
+
+
 
 
 function addSelectedTextAsBubble() {
@@ -2121,11 +2346,12 @@ function closeActionMenu() {
     });
 
     document.removeEventListener('click', onOutsideClick);
-    document.removeEventListener('scroll', closeActionMenu, true);
 }
 
 function showActionMenu(mesid, anchorEl) {
     closeActionMenu();
+    $('#mm_visual_voice_panel').remove();
+    $('#mm_favorite_audio_panel').remove();
 
     var data = getMessageData(mesid);
     var hasCache = !!(s().serverHistory[data.key] && s().serverHistory[data.key].versions && s().serverHistory[data.key].versions.length);
@@ -2168,7 +2394,7 @@ function showActionMenu(mesid, anchorEl) {
 
     document.body.appendChild(menu);
 
-    // 定位
+    // 定位：手机端和电脑端一样，菜单贴着触发按钮附近显示
     var rect = anchorEl.getBoundingClientRect();
     var mw = menu.offsetWidth;
     var mh = menu.offsetHeight;
@@ -2181,9 +2407,14 @@ function showActionMenu(mesid, anchorEl) {
         // 悬浮按钮菜单优先显示在按钮右侧
         left = rect.right + 8;
 
-        // 如果右侧空间不够，就贴近右边界，避免超出屏幕
+        // 如果右侧空间不够，就显示在按钮左侧
         if (left + mw > window.innerWidth - 8) {
-            left = window.innerWidth - mw - 8;
+            left = rect.left - mw - 8;
+        }
+
+        // 左侧也不够，就贴屏幕左边
+        if (left < 8) {
+            left = 8;
         }
     } else {
         // 消息旁边的小喇叭菜单保持原逻辑：优先显示在左侧
@@ -2212,22 +2443,29 @@ function showActionMenu(mesid, anchorEl) {
     menu.style.top = top + 'px';
     menu.style.position = 'fixed';
 
-    // 点外面关闭
+
+    // 点外面关闭。手机端不再监听 scroll，避免菜单因为轻微滚动/地址栏变化自动关闭。
     setTimeout(function () {
         document.addEventListener('click', onOutsideClick);
-        document.addEventListener('scroll', closeActionMenu, true);
     }, 50);
 }
 
 function onOutsideClick(e) {
     if (e.target.closest && e.target.closest('.mm-action-menu')) return;
+    if (e.target.closest && e.target.closest('#mm_fab_wrap')) return;
     closeActionMenu();
 }
 
+
 async function handleActionClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+
     var action = this.dataset.action;
     var mesid = Number(this.dataset.mesid);
     closeActionMenu();
+
+    
 
     var data = getMessageData(mesid);
 
@@ -2298,6 +2536,9 @@ async function handleActionClick(e) {
 }
 
 function openVisualVoicePanel(id) {
+    $('#mm_favorite_audio_panel').remove();
+    $('#mm_visual_voice_panel').remove();
+
     var data = getMessageData(id);
     var h = s().serverHistory[data.key];
 
@@ -2494,6 +2735,16 @@ function openVisualVoicePanel(id) {
         $('#mm_visual_voice_panel').remove();
         $('body').append(html);
 
+        forceMobilePopupPanel('mm_visual_voice_panel');
+
+        setTimeout(function () {
+            forceMobilePopupPanel('mm_visual_voice_panel');
+        }, 50);
+
+        setTimeout(function () {
+            forceMobilePopupPanel('mm_visual_voice_panel');
+        }, 250);
+
         bindEvents();
     }
 
@@ -2511,6 +2762,18 @@ function openVisualVoicePanel(id) {
             refreshAllMessageButtons();
             toastr.warning('已取消修改');
         });
+
+        $('#mm_visual_voice_panel').on('click', function (e) {
+            if (e.target === this) {
+                version.items = cloneItems(originalItems);
+                $('#mm_visual_voice_panel').remove();
+                injectBubbles(id);
+                refreshBubbleStates(id);
+                refreshAllMessageButtons();
+                toastr.warning('已取消修改');
+            }
+        });
+
 
         $('#mm_vp_confirm').on('click', function () {
             version.items = cloneItems(workingItems);
@@ -2862,6 +3125,9 @@ async function favoriteBubbleAudio(mesid, segidx) {
 }
 
 function openFavoriteAudioPanel() {
+    $('#mm_visual_voice_panel').remove();
+    $('#mm_favorite_audio_panel').remove();
+
     if (!s().favoriteAudios) {
         s().favoriteAudios = [];
     }
@@ -2918,10 +3184,26 @@ function openFavoriteAudioPanel() {
     $('#mm_favorite_audio_panel').remove();
     $('body').append(html);
 
+    forceMobilePopupPanel('mm_favorite_audio_panel');
+
+    setTimeout(function () {
+        forceMobilePopupPanel('mm_favorite_audio_panel');
+    }, 50);
+
+    setTimeout(function () {
+        forceMobilePopupPanel('mm_favorite_audio_panel');
+    }, 250);
+
     $('#mm_favorite_audio_panel .mm-fav-close').on('click', function () {
         $('#mm_favorite_audio_panel').remove();
     });
 
+    $('#mm_favorite_audio_panel').on('click', function (e) {
+        if (e.target === this) {
+            $('#mm_favorite_audio_panel').remove();
+        }
+    });
+    
     $('#mm_favorite_audio_panel .mm-fav-play').on('click', async function () {
         var idx = Number($(this).data('idx'));
         var fav = s().favoriteAudios[idx];
@@ -3018,14 +3300,24 @@ function openParamsEditor(id) {
                 + '<div class="minimax-tts-editor-row-flex"><label>音调</label><input class="text_pole edit-v" data-prop="pitch" type="number" step="1" data-idx="' + i + '" value="' + it.options.pitch + '"></div>'
                 + '</div></div>';
         }
-        var html = '<div id="minimax_quote_tts_editor" class="minimax-tts-editor-mask"><div class="minimax-tts-editor-dialog">'
-            + '<div class="minimax-tts-editor-header">'
-            + '<div style="font-weight:bold;font-size:1.1rem;flex:1">版本 ' + (h.activeIndex + 1) + '/' + h.versions.length + '</div>'
-            + '<div style="display:flex;gap:10px;align-items:center;flex:1"><button class="menu_button v-prev" style="width:40px">&lt;</button><button class="menu_button v-next" style="width:40px">&gt;</button><button class="menu_button v-del" style="color:#ef5350">删除</button></div>'
-            + '<div style="text-align:right"><button class="menu_button editor-close">关闭</button></div>'
+        var _edMobile = window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+        var _edHeaderStyle = _edMobile
+            ? 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 10px'
+            : '';
+        var _edActionsStyle = _edMobile
+            ? 'display:flex;flex-wrap:wrap;gap:8px;padding:8px 10px;position:sticky;bottom:0;background:var(--SmartThemeBlurTintColor,#1a1c2a);z-index:10'
+            : '';
+        var _edDialogStyle = _edMobile
+            ? 'width:94vw!important;max-width:94vw!important;max-height:85dvh!important;overflow:hidden!important'
+            : '';
+        var _edBtnStyle = _edMobile ? 'min-height:38px;font-size:0.82rem' : 'height:40px';
+        var html = '<div id="minimax_quote_tts_editor" class="minimax-tts-editor-mask"><div class="minimax-tts-editor-dialog" style="' + _edDialogStyle + '">'
+            + '<div class="minimax-tts-editor-header" style="' + _edHeaderStyle + '">'
+            + '<div style="font-weight:bold;font-size:1.1rem;flex:1;min-width:80px">版本 ' + (h.activeIndex + 1) + '/' + h.versions.length + '</div>'
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="menu_button v-prev" style="width:40px">&lt;</button><button class="menu_button v-next" style="width:40px">&gt;</button><button class="menu_button v-del" style="color:#ef5350">删除</button><button class="menu_button editor-close">关闭</button></div>'
             + '</div>'
             + '<div class="minimax-tts-editor-body">' + rows + '</div>'
-            + '<div class="minimax-tts-editor-actions"><button class="menu_button editor-save-only" style="height:40px">保存修改</button><button class="menu_button editor-confirm" style="height:40px">确认选择此版本</button></div>'
+            + '<div class="minimax-tts-editor-actions" style="' + _edActionsStyle + '"><button class="menu_button editor-save-only" style="' + _edBtnStyle + '">保存修改</button><button class="menu_button editor-confirm" style="' + _edBtnStyle + '">确认选择此版本</button></div>'
             + '</div></div>';
 
         $('#minimax_quote_tts_editor').remove();
@@ -3046,8 +3338,25 @@ function openParamsEditor(id) {
         $('#minimax_quote_tts_editor .editor-close').on('click', function () { $('#minimax_quote_tts_editor').remove(); inv(); });
         $('#minimax_quote_tts_editor .edit-v').on('change input', function () {
             var p = $(this).data('prop'), idx = $(this).data('idx'), val = $(this).val();
-            if (p === 'speaker') { v.items[idx].speaker = val; var b = findCharacterBinding(val); if (b) { v.items[idx].options.model = b.model || s().model; v.items[idx].options.voiceId = b.voiceId || s().voiceId; render(); } }
-            else { v.items[idx].options[p] = val; }
+            if (p === 'speaker') { 
+                v.items[idx].speaker = val; 
+                var b = findCharacterBinding(val); 
+                if (b) { 
+                    v.items[idx].options.model = b.model || s().model; 
+                    v.items[idx].options.voiceId = b.voiceId || s().voiceId; 
+                    render(); 
+                } 
+            } else { 
+                if (p === 'speed' || p === 'vol' || p === 'pitch') {
+                    val = Number(val);
+                    if (!Number.isFinite(val)) {
+                        if (p === 'speed') val = 1.0;
+                        if (p === 'vol') val = 1.0;
+                        if (p === 'pitch') val = 0;
+                    }
+                }
+                v.items[idx].options[p] = val; 
+            }
             v.items[idx].serverPath = null;
         });
         $('#minimax_quote_tts_editor .editor-save-only').on('click', function () { saveSettingsDebounced(); toastr.success('已保存'); });
@@ -3083,18 +3392,15 @@ function injectStyles() {
     st.textContent = '.mm-config-mask{display:none;position:fixed;inset:0;z-index:2147483001!important;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);justify-content:center;align-items:center;padding:16px}.mm-config-mask.mm-config-open{display:flex!important}.mm-config-dialog{width:min(680px,96vw);max-height:92vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}.mm-config-header{display:flex;align-items:center;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.08);flex-shrink:0;gap:8px}.mm-config-close{background:none;border:none;color:inherit;font-size:1.2rem;cursor:pointer;padding:4px 8px;opacity:.6;flex-shrink:0}.mm-config-close:hover{opacity:1}.mm-config-body{flex:1;overflow-y:auto;padding:16px}.mm-tab-bar{display:flex;gap:2px;flex:1;flex-wrap:wrap}.mm-tab{background:transparent;border:none;color:inherit;padding:6px 14px;cursor:pointer;border-radius:8px 8px 0 0;font-size:.88rem;opacity:.55;white-space:nowrap}.mm-tab:hover{opacity:.8;background:rgba(255,255,255,.04)}.mm-tab.active{opacity:1;background:rgba(255,255,255,.08);font-weight:600}.mm-tab-panel{display:none}.mm-tab-panel.active{display:block}.mm-config-dialog .mm-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}.mm-config-dialog .mm-row>label{min-width:85px;flex-shrink:0;font-size:.88rem;opacity:.8}.mm-config-dialog .text_pole{flex:1;min-width:0;max-width:100%;box-sizing:border-box;height:34px!important;font-size:.88rem!important}.mm-config-dialog textarea.text_pole{height:auto!important;min-height:64px;resize:vertical}.mm-config-dialog select.text_pole{flex:1;min-width:0}.mm-config-dialog input[type=checkbox]{flex:none;width:18px;height:18px}.mm-section-title{font-weight:600;font-size:.95rem;margin:16px 0 8px;display:flex;align-items:center;gap:10px}.mm-desc{font-size:.82rem;opacity:.55;margin:0 0 10px;line-height:1.4}.mm-inline-hint{font-size:.78rem;opacity:.45;margin-left:6px}.mm-voice-lib-row,.mm-binding-row,.mm-rule-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}.mm-rule-header-row{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:.78rem;opacity:.45}.mm-rule-header-row>span{flex:1}.mm-bubble-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-top:6px;border-top:1px dashed rgba(255,255,255,.08)}.mm-bubble{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;background:rgba(76,175,80,.15);color:var(--SmartThemeBodyColor,#ccc);font-size:.82rem;cursor:pointer;transition:background .15s;user-select:none;vertical-align:middle;margin:0 2px}.mm-bubble:hover{background:rgba(76,175,80,.3)}.mm-bubble i{font-size:.72rem;opacity:.6}.mm-bubble-cached{background:rgba(33,150,243,.15)}.mm-bubble-cached:hover{background:rgba(33,150,243,.3)}.mm-bubble-loading{opacity:.5;pointer-events:none}.mm-bubble-playing{background:rgba(255,152,0,.2);animation:mm-pulse .8s infinite alternate}@keyframes mm-pulse{from{opacity:.7}to{opacity:1}}.mes_quote_tts{cursor:pointer;opacity:.5;transition:opacity .15s}.mes_quote_tts:hover{opacity:1}.mes_quote_tts.ready{color:#4caf50;opacity:.8}.minimax-tts-editor-mask{position:fixed;inset:0;z-index:2147483002;background:rgba(0,0,0,.55);display:flex;justify-content:center;align-items:center;padding:16px}.minimax-tts-editor-dialog{width:min(720px,96vw);max-height:90vh;background:var(--SmartThemeBlurTintColor,#1a1c2a);color:var(--SmartThemeBodyColor,#ccc);border-radius:16px;box-shadow:0 12px 48px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}.minimax-tts-editor-header{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.08);gap:12px}.minimax-tts-editor-body{flex:1;overflow-y:auto;padding:16px}.minimax-tts-editor-item{padding:12px;margin-bottom:12px;border-radius:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06)}.minimax-tts-editor-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}.minimax-tts-editor-row-flex{display:flex;align-items:center;gap:6px}.minimax-tts-editor-row-flex label{min-width:40px;font-size:.82rem;opacity:.6}.minimax-tts-editor-actions{display:flex;gap:12px;padding:12px 16px;border-top:1px solid rgba(255,255,255,.08)}.minimax-tts-editor-actions .menu_button{flex:1}.mm-fab-wrap{position:fixed;right:24px;bottom:80px;z-index:2147483000}.mm-fab{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#4caf50,#2196f3);color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,.35);transition:transform .15s,box-shadow .15s;touch-action:none;user-select:none}.mm-fab:hover{transform:scale(1.08);box-shadow:0 6px 28px rgba(0,0,0,.45)}.mm-fab.generating{animation:mm-fab-spin 1.2s linear infinite}@keyframes mm-fab-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}.mm-fab img{width:36px;height:36px;border-radius:50%;object-fit:cover;pointer-events:none}';
     st.textContent += `
     
-#mm_mobile_float_btn{
-    display:none!important;visibility:hidden!important;
-    pointer-events:none!important;
-}
-#mm_mobile_float_btn:hover{
-    display:none!important;
+#mm_mobile_float_btn,
+#mm_mobile_float_btn:hover {
+    display: none !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
 }
 
 @media screen and (max-width: 700px) {
-    #mm_mobile_float_btn {
-        display: none !important;
-    }
+
 
     .mm-config-mask.mm-config-open {
         display: flex !important;
@@ -3248,7 +3554,7 @@ function injectStyles() {
 st.textContent += `
 .mm-action-menu{
     position:absolute;
-    z-index:2147483002;
+    z-index:2147483646;
     display:flex;
     flex-direction:column;
     gap:6px;
@@ -3360,51 +3666,7 @@ st.textContent += `
     background:rgba(255,255,255,.16);
     transform:none!important;
 }
-#mm_inline_editor_bar {
-    position: fixed !important;
-    left: 50% !important;
-    bottom: 24px !important;
-    transform: translateX(-50%) !important;
-    z-index: 2147483600 !important;
 
-    display: flex !important;
-    align-items: center !important;
-    gap: 10px !important;
-
-    padding: 10px 12px !important;
-    border-radius: 999px !important;
-    background: rgba(42, 32, 24, 0.96) !important;
-    color: #fff7e8 !important;
-    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45) !important;
-    font-size: 13px !important;
-}
-
-.mm-inline-editor-title {
-    white-space: nowrap !important;
-    opacity: 0.95 !important;
-}
-
-.mm-inline-editor-undo,
-.mm-inline-editor-save,
-.mm-inline-editor-cancel {
-    border: none !important;
-    outline: none !important;
-    border-radius: 999px !important;
-    padding: 6px 12px !important;
-    cursor: pointer !important;
-    font-weight: 700 !important;
-}
-
-
-.mm-inline-editor-save {
-    background: #f4ead8 !important;
-    color: #5a341e !important;
-}
-
-.mm-inline-editor-cancel {
-    background: rgba(255, 255, 255, 0.16) !important;
-    color: #ffffff !important;
-}
 
 .mm-bubble-editing {
     position: relative !important;
@@ -3498,22 +3760,25 @@ st.textContent += `
 
 #mm_fab_wrap,
 .mm-fab-wrap {
-    width: 52px !important;
-    height: 52px !important;
-    min-width: 52px !important;
-    min-height: 52px !important;
-    max-width: 52px !important;
-    max-height: 52px !important;
+    width: 56px !important;
+    height: 56px !important;
+    min-width: 56px !important;
+    min-height: 56px !important;
+    max-width: 56px !important;
+    max-height: 56px !important;
 }
 
 #mm_fab,
 .mm-fab {
-    width: 52px !important;
-    height: 52px !important;
-    min-width: 52px !important;
-    min-height: 52px !important;
-    max-width: 52px !important;
-    max-height: 52px !important;
+    width: 54px !important;
+    height: 54px !important;
+    min-width: 54px !important;
+    min-height: 54px !important;
+    max-width: 54px !important;
+    max-height: 54px !important;
+
+    border-radius: 50% !important;
+    box-sizing: border-box !important;
 
     padding: 0 !important;
     margin: 0 !important;
@@ -3526,7 +3791,7 @@ st.textContent += `
     box-shadow: none !important;
 
     color: #ffffff !important;
-    font-size: 30px !important;
+    font-size: 28px !important;
     line-height: 1 !important;
 
     display: flex !important;
@@ -3567,18 +3832,21 @@ st.textContent += `
 
 #mm_fab img,
 .mm-fab img {
-    width: 52px !important;
-    height: 52px !important;
-    min-width: 52px !important;
-    min-height: 52px !important;
-    max-width: 52px !important;
-    max-height: 52px !important;
+    width: 54px !important;
+    height: 54px !important;
+    min-width: 54px !important;
+    min-height: 54px !important;
+    max-width: 54px !important;
+    max-height: 54px !important;
 
     object-fit: cover !important;
     object-position: center center !important;
 
     transform: scale(1.18) !important;
     transform-origin: center center !important;
+
+    border-radius: 50% !important;
+    box-sizing: border-box !important;
 
     display: block !important;
     padding: 0 !important;
@@ -3626,10 +3894,7 @@ st.textContent += `
     color: #7f1f17 !important;
 }
 
-.mm-inline-editor-undo {
-    background: #d8b98b !important;
-    color: #4a2a13 !important;
-}
+
 
 .mm-bubble-editing {
     cursor: pointer !important;
@@ -3640,32 +3905,13 @@ st.textContent += `
 `;
     // ===== [覆盖] 去掉绿色旧按钮，并把 mm_fab 改成非绿色样式 =====
     st.textContent += `
-#mm_mobile_float_btn {
-    display: none !important;
-    visibility: hidden !important;
-    opacity: 0 !important;
-    pointer-events: none !important;
-}
-
-#mm_mobile_float_btn:hover {
-    display: none !important;
-    visibility: hidden !important;
-    opacity: 0 !important;
-    pointer-events: none !important;
-}
-
-#mm_mobile_float_btn::before,
-#mm_mobile_float_btn::after {
-    display: none !important;
-}
-
 #mm_fab {
-    width: 58px !important;
-    height: 58px !important;
-    min-width: 58px !important;
-    min-height: 58px !important;
-    max-width: 58px !important;
-    max-height: 58px !important;
+    width: 54px !important;
+    height: 54px !important;
+    min-width: 54px !important;
+    min-height: 54px !important;
+    max-width: 54px !important;
+    max-height: 54px !important;
 
     background: transparent !important;
     background-color: transparent !important;
@@ -3676,7 +3922,7 @@ st.textContent += `
     box-shadow: none !important;
 
     font-size: 30px !important;
-    line-height: 58px !important;
+    line-height: 54px !important;
 
     display: flex !important;
     align-items: center !important;
@@ -3692,45 +3938,14 @@ st.textContent += `
 }
 
 #mm_fab.generating {
-    background: transparent !important;
-    background-color: transparent !important;
-    border: none !important;
-    outline: none !important;
-    box-shadow: none !important;
-}
-
-
-#mm_fab:hover {
-    background: transparent !important;
-    background-color: transparent !important;
-    border: none !important;
-    outline: none !important;
-    box-shadow: none !important;
-}
-
-#mm_fab.generating {
-    background: transparent !important;
-    background-color: transparent !important;
-    border: none !important;
-    outline: none !important;
-    box-shadow: none !important;
-}
-
-
-#mm_fab.generating {
     background: rgba(45, 48, 70, 0.96) !important;
     background-color: rgba(45, 48, 70, 0.96) !important;
-}
-
-@media screen and (max-width: 700px) {
-    #mm_mobile_float_btn {
-        display: none !important;
-        visibility: hidden !important;
-        opacity: 0 !important;
-        pointer-events: none !important;
-    }
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
 }
 `;
+
 
     // ===== [修改结束] =====
     st.textContent += `
@@ -3739,12 +3954,12 @@ st.textContent += `
     position: fixed !important;
     z-index: 2147483000 !important;
 
-    width: 52px !important;
-    height: 52px !important;
-    min-width: 52px !important;
-    min-height: 52px !important;
-    max-width: 52px !important;
-    max-height: 52px !important;
+    width: 56px !important;
+    height: 56px !important;
+    min-width: 56px !important;
+    min-height: 56px !important;
+    max-width: 56px !important;
+    max-height: 56px !important;
 
     display: flex;
     align-items: center;
@@ -4048,6 +4263,248 @@ st.textContent += `
 }
 `;
 
+    st.textContent += `
+@media screen and (max-width: 700px) {
+    #mm_visual_voice_panel {
+        display: flex !important;
+        position: fixed !important;
+        inset: 0 !important;
+        width: 100vw !important;
+        height: 100dvh !important;
+        z-index: 2147483647 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        padding: 8px !important;
+        box-sizing: border-box !important;
+    }
+
+    #mm_visual_voice_panel .mm-vp-dialog {
+        width: 94vw !important;
+        max-width: 94vw !important;
+        height: 86dvh !important;
+        max-height: 86dvh !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+    }
+
+    #mm_visual_voice_panel .mm-vp-body {
+        flex: 1 1 auto !important;
+        min-height: 0 !important;
+        height: auto !important;
+        max-height: none !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        -webkit-overflow-scrolling: touch !important;
+    }
+
+    #mm_visual_voice_panel .mm-vp-footer {
+        flex-shrink: 0 !important;
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+        padding: 8px 10px calc(env(safe-area-inset-bottom, 0px) + 8px) 10px !important;
+        box-sizing: border-box !important;
+        background: rgba(0,0,0,.22) !important;
+    }
+
+    #mm_visual_voice_panel .mm-vp-footer .menu_button {
+        min-height: 34px !important;
+        font-size: 0.82rem !important;
+    }
+}
+`;
+    st.textContent += `
+@media screen and (max-width: 700px) {
+    #mm_favorite_audio_panel {
+        display: flex !important;
+        position: fixed !important;
+        inset: 0 !important;
+        width: 100vw !important;
+        height: 100dvh !important;
+        z-index: 2147483647 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        padding: 8px !important;
+        box-sizing: border-box !important;
+    }
+
+    #mm_favorite_audio_panel .mm-fav-dialog {
+        width: 94vw !important;
+        max-width: 94vw !important;
+        height: 86dvh !important;
+        max-height: 86dvh !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+    }
+
+    #mm_favorite_audio_panel .mm-fav-body {
+        flex: 1 1 auto !important;
+        min-height: 0 !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        -webkit-overflow-scrolling: touch !important;
+        padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 12px) !important;
+    }
+
+    #mm_favorite_audio_panel .mm-fav-actions {
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+    }
+
+    #mm_favorite_audio_panel .mm-fav-actions .menu_button {
+        min-height: 34px !important;
+        font-size: 0.82rem !important;
+    }
+}
+`;
+    st.textContent += `
+.mm-bubble {
+    touch-action: manipulation !important;
+    -webkit-user-select: none !important;
+    user-select: none !important;
+    -webkit-touch-callout: none !important;
+}
+
+.mm-bubble-strip {
+    touch-action: pan-y !important;
+}
+
+@media screen and (max-width: 700px) {
+    .mm-bubble {
+        min-height: 24px !important;
+        line-height: 1.25 !important;
+    }
+
+    .mm-bubble i {
+        pointer-events: none !important;
+    }
+}
+`;
+
+    st.textContent += `
+/* MiniMax TTS final override */
+
+#mm_fab_wrap {
+    position: fixed !important;
+    z-index: 2147483000 !important;
+    width: 56px !important;
+    height: 56px !important;
+    min-width: 56px !important;
+    min-height: 56px !important;
+    max-width: 56px !important;
+    max-height: 56px !important;
+    border-radius: 50% !important;
+    box-sizing: border-box !important;
+    pointer-events: auto !important;
+    touch-action: none !important;
+    user-select: none !important;
+    overflow: visible !important;
+}
+
+#mm_fab {
+    width: 54px !important;
+    height: 54px !important;
+    min-width: 54px !important;
+    min-height: 54px !important;
+    max-width: 54px !important;
+    max-height: 54px !important;
+    border-radius: 50% !important;
+    box-sizing: border-box !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    pointer-events: auto !important;
+    touch-action: none !important;
+    user-select: none !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    overflow: hidden !important;
+}
+
+.mm-action-menu {
+    position: fixed !important;
+    z-index: 2147483646 !important;
+    pointer-events: auto !important;
+}
+
+.mm-action-btn {
+    touch-action: manipulation !important;
+    min-height: 42px !important;
+    min-width: 120px !important;
+    -webkit-tap-highlight-color: transparent !important;
+}
+
+@media screen and (max-width: 700px) {
+    .mm-action-menu {
+        max-width: calc(100vw - 16px) !important;
+        max-height: calc(100vh - 16px) !important;overflow-y: auto !important;
+    }.mm-action-btn {
+        min-height: 46px !important;
+        font-size: 0.92rem !important;
+        padding: 10px 16px !important;
+    }
+}
+`;
+
+    st.textContent += `
+@media screen and (max-width: 700px) {
+    .minimax-tts-editor-mask {
+        padding: 0 !important;align-items: center !important;
+        justify-content: center !important;
+    }
+    .minimax-tts-editor-dialog {
+        width: 96vw !important;
+        max-width: 96vw !important;
+        height: 88dvh !important;
+        max-height: 88dvh !important;
+        border-radius: 12px !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+    }
+    .minimax-tts-editor-header {
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+        padding: 8px 10px !important;
+        flex-shrink: 0 !important;}
+    .minimax-tts-editor-header > div {
+        min-width: 0 !important;
+    }
+    .minimax-tts-editor-body {
+        flex: 1 1 auto !important;
+        overflow-y: auto !important;-webkit-overflow-scrolling: touch !important;
+        padding: 8px !important;
+    }
+    .minimax-tts-editor-actions {
+        flex-shrink: 0 !important;
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 8px !important;
+        padding: 8px 10px !important;
+        border-top: 1px solid rgba(255,255,255,.1) !important;
+        position: sticky !important;
+        bottom: 0 !important;
+        background: var(--SmartThemeBlurTintColor, #1a1c2a) !important;
+        z-index: 10 !important;
+    }
+    .minimax-tts-editor-actions .menu_button {
+        flex: 1 1 auto !important;
+        min-height: 42px !important;
+        font-size: 0.88rem !important;
+    }
+    .minimax-tts-editor-grid {
+        grid-template-columns: 1fr !important;
+    }
+    .minimax-tts-editor-item {
+        padding: 8px !important;
+    }
+}
+`;
+
+
 
     document.head.appendChild(st);
 
@@ -4213,6 +4670,7 @@ function populateConfigFields() {
     el('mm_show_bubbles').checked = set.showBubbles || false;
     el('mm_show_fab').checked = set.showFloatingBtn !== false;
     el('mm_fab_img').value = set.floatingBtnImg || '';
+    if (el('mm_fab_border_color')) el('mm_fab_border_color').value = set.floatingBtnBorderColor || '#d9c2ff';
     renderVoiceLibrary(); refreshVoiceSelects();
     var vs = el('mm_voice_sel'), vi = el('mm_voice');
     if (vs && vi) {
@@ -4233,6 +4691,127 @@ function populateConfigFields() {
     if (fSel && set.formatterPresetIdx >= 0) fSel.value = set.formatterPresetIdx;
     if (set.llmPresets.length && set.formatterPresetIdx >= 0) loadLlmPresetFieldsGlobal(set.formatterPresetIdx);
 }
+
+function forceMobilePopupPanel(panelId) {
+    var mask = document.getElementById(panelId);
+    var dialog = mask ? mask.querySelector('.mm-config-dialog') : null;
+    var body = dialog ? dialog.querySelector('.mm-config-body') : null;
+    var header = dialog ? dialog.querySelector('.mm-config-header') : null;
+    var footer = dialog ? dialog.querySelector('.mm-vp-footer') : null;
+
+    if (!mask || !dialog) {
+        return;
+    }
+
+    var isMobileLike = window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
+    if (!isMobileLike) {
+        mask.style.setProperty('z-index', '2147483647', 'important');
+        dialog.style.setProperty('z-index', '2147483647', 'important');
+        return;
+    }
+
+    mask.classList.add('mm-config-open');
+
+    mask.style.setProperty('display', 'flex', 'important');
+    mask.style.setProperty('visibility', 'visible', 'important');
+    mask.style.setProperty('opacity', '1', 'important');
+    mask.style.setProperty('pointer-events', 'auto', 'important');
+
+    mask.style.setProperty('position', 'fixed', 'important');
+    mask.style.setProperty('left', '0', 'important');
+    mask.style.setProperty('top', '0', 'important');
+    mask.style.setProperty('right', '0', 'important');
+    mask.style.setProperty('bottom', '0', 'important');
+    mask.style.setProperty('inset', '0', 'important');
+
+    mask.style.setProperty('width', '100vw', 'important');
+    mask.style.setProperty('height', '100vh', 'important');
+    mask.style.setProperty('height', '100dvh', 'important');
+
+    mask.style.setProperty('padding', '8px', 'important');
+    mask.style.setProperty('margin', '0', 'important');
+    mask.style.setProperty('box-sizing', 'border-box', 'important');
+    mask.style.setProperty('overflow', 'hidden', 'important');
+
+    mask.style.setProperty('align-items', 'center', 'important');
+    mask.style.setProperty('justify-content', 'center', 'important');
+
+    mask.style.setProperty('background', 'rgba(0, 0, 0, 0.58)', 'important');
+    mask.style.setProperty('z-index', '2147483647', 'important');
+
+    dialog.style.setProperty('display', 'flex', 'important');
+    dialog.style.setProperty('visibility', 'visible', 'important');
+    dialog.style.setProperty('opacity', '1', 'important');
+    dialog.style.setProperty('pointer-events', 'auto', 'important');
+
+    dialog.style.setProperty('position', 'relative', 'important');
+    dialog.style.setProperty('left', 'auto', 'important');
+    dialog.style.setProperty('top', 'auto', 'important');
+    dialog.style.setProperty('right', 'auto', 'important');
+    dialog.style.setProperty('bottom', 'auto', 'important');
+    dialog.style.setProperty('transform', 'none', 'important');
+
+    dialog.style.setProperty('width', '94vw', 'important');
+    dialog.style.setProperty('max-width', '94vw', 'important');
+    dialog.style.setProperty('min-width', '0', 'important');
+
+    dialog.style.setProperty('height', '86dvh', 'important');
+    dialog.style.setProperty('max-height', '86dvh', 'important');
+    dialog.style.setProperty('min-height', '0', 'important');
+
+    dialog.style.setProperty('margin', '0', 'important');
+    dialog.style.setProperty('padding', '0', 'important');
+    dialog.style.setProperty('box-sizing', 'border-box', 'important');
+
+    dialog.style.setProperty('border-radius', '14px', 'important');
+    dialog.style.setProperty('overflow', 'hidden', 'important');
+    dialog.style.setProperty('flex-direction', 'column', 'important');
+
+    dialog.style.setProperty('background', 'var(--SmartThemeBlurTintColor, #1a1c2a)', 'important');
+    dialog.style.setProperty('color', 'var(--SmartThemeBodyColor, #ccc)', 'important');
+    dialog.style.setProperty('box-shadow', '0 12px 48px rgba(0,0,0,.55)', 'important');
+    dialog.style.setProperty('z-index', '2147483647', 'important');
+
+    if (header) {
+        header.style.setProperty('display', 'flex', 'important');
+        header.style.setProperty('align-items', 'center', 'important');
+        header.style.setProperty('flex-shrink', '0', 'important');
+        header.style.setProperty('padding', '8px 10px', 'important');
+        header.style.setProperty('gap', '6px', 'important');
+    }
+
+    if (body) {
+        body.style.setProperty('display', 'block', 'important');
+        body.style.setProperty('flex', '1 1 auto', 'important');
+        body.style.setProperty('height', footer ? 'calc(86dvh - 98px)' : 'calc(86dvh - 48px)', 'important');
+        body.style.setProperty('max-height', footer ? 'calc(86dvh - 98px)' : 'calc(86dvh - 48px)', 'important');
+        body.style.setProperty('min-height', '0', 'important');
+        body.style.setProperty('overflow-y', 'auto', 'important');
+        body.style.setProperty('overflow-x', 'hidden', 'important');
+        body.style.setProperty('padding', '10px', 'important');
+        body.style.setProperty('-webkit-overflow-scrolling', 'touch', 'important');
+    }
+
+    if (footer) {
+        footer.style.setProperty('display', 'flex', 'important');
+        footer.style.setProperty('flex-shrink', '0', 'important');
+        footer.style.setProperty('padding', '8px 10px', 'important');
+        footer.style.setProperty('gap', '6px', 'important');
+        footer.style.setProperty('flex-wrap', 'wrap', 'important');
+    }
+
+    dialog.querySelectorAll('.text_pole').forEach(function (input) {
+        input.style.setProperty('max-width', '100%', 'important');
+        input.style.setProperty('box-sizing', 'border-box', 'important');
+        input.style.setProperty('font-size', '0.82rem', 'important');
+    });
+
+    dialog.querySelectorAll('button').forEach(function (btn) {
+        btn.style.setProperty('touch-action', 'manipulation', 'important');
+    });
+}
+
 
 function applyMobileConfigPanelLayout() {
     var mask = document.getElementById('mm-config-mask');
@@ -4432,6 +5011,20 @@ function openConfigPanel() {
             + '<div class="mm-row"><label>API地址</label><input id="mm_llm_url" class="text_pole" type="text" placeholder="https://api.openai.com/v1"></div>'
             + '<div class="mm-row"><label>API密钥</label><input id="mm_llm_key" class="text_pole" type="password" autocomplete="off"></div>'
             + '<div class="mm-row"><label>模型</label><input id="mm_llm_model" class="text_pole" type="text"><select id="mm_llm_model_sel" class="text_pole" style="display:none"></select><button id="mm_llm_fetch" class="menu_button">获取</button><button id="mm_llm_test_conn" class="menu_button">测试</button></div>'
+            + '<div class="mm-section-title" style="margin-top:50px">悬浮窗外环</div>'
+            + '<p class="mm-desc">调整悬浮窗图片外侧的球体边框颜色。</p>'
+            + '<div class="mm-row"><label>外环颜色</label><select id="mm_fab_border_color" class="text_pole">'
+            + '<option value="#d9c2ff">浅紫色</option>'
+            + '<option value="#87cefa">天蓝色</option>'
+            + '<option value="#0d47a1">深蓝色</option>'
+            + '<option value="#ffffff">白色</option>'
+            + '<option value="#000000">黑色</option>'
+            + '<option value="#ffb6c1">粉色</option>'
+            + '<option value="#f5f5dc">米色</option>'
+            + '<option value="#fff9c4">淡黄色</option>'
+            + '<option value="#ffa500">橙色</option>'
+            + '<option value="#b7f5c1">淡绿色</option>'
+            + '</select></div>'
             + '</div>'
 
             // ─── 格式化面板 ───
@@ -4465,6 +5058,7 @@ function openConfigPanel() {
         document.body.insertAdjacentHTML('beforeend', panelHtml);
 
         renderTtsLogs();
+        if (document.getElementById('mm_fab_border_color')) document.getElementById('mm_fab_border_color').value = s().floatingBtnBorderColor || '#d9c2ff';
 
 
         // Tab切换
@@ -4523,6 +5117,8 @@ function openConfigPanel() {
             s().autoPlay = document.getElementById('mm_autoplay').checked;
             s().showFloatingBtn = document.getElementById('mm_show_fab').checked;
             s().floatingBtnImg = document.getElementById('mm_fab_img').value || '';
+            var fabBorderColorEl = document.getElementById('mm_fab_border_color');
+            if (fabBorderColorEl) s().floatingBtnBorderColor = fabBorderColorEl.value || '#d9c2ff';
             if (window._mmFabUpdate) window._mmFabUpdate();
             s().defaultMaleVoiceId = document.getElementById('mm_def_male').value || '';
             s().defaultFemaleVoiceId = document.getElementById('mm_def_female').value || '';
@@ -4544,7 +5140,7 @@ function openConfigPanel() {
             s().showBubbles = this.checked;saveSettingsDebounced();if (this.checked) refreshAllBubbles(); else removeAllBubbles();
         });
 
-        var syncIds = ['mm_key', 'mm_gid', 'mm_apihost', 'mm_custom_host', 'mm_model', 'mm_voice_sel', 'mm_voice', 'mm_speed', 'mm_vol', 'mm_tts_lang', 'mm_autoplay', 'mm_def_male', 'mm_def_female', 'mm_auto_clear','mm_show_fab', 'mm_fab_img'];
+        var syncIds = ['mm_key', 'mm_gid', 'mm_apihost', 'mm_custom_host', 'mm_model', 'mm_voice_sel', 'mm_voice', 'mm_speed', 'mm_vol', 'mm_tts_lang', 'mm_autoplay', 'mm_def_male', 'mm_def_female', 'mm_auto_clear','mm_show_fab', 'mm_fab_img', 'mm_fab_border_color'];
 
         for (var si = 0; si < syncIds.length; si++) {
             var syncEl = document.getElementById(syncIds[si]);
@@ -5148,21 +5744,21 @@ function createUi() {
     var mmFab = document.getElementById('mm_fab');
 
     if (mmFabWrap) {
-        mmFabWrap.style.width = '52px';
-        mmFabWrap.style.height = '52px';
-        mmFabWrap.style.minWidth = '52px';
-        mmFabWrap.style.minHeight = '52px';
-        mmFabWrap.style.maxWidth = '52px';
-        mmFabWrap.style.maxHeight = '52px';
+        mmFabWrap.style.width = '56px';
+        mmFabWrap.style.height = '56px';
+        mmFabWrap.style.minWidth = '56px';
+        mmFabWrap.style.minHeight = '56px';
+        mmFabWrap.style.maxWidth = '56px';
+        mmFabWrap.style.maxHeight = '56px';
     }
 
     if (mmFab) {
-        mmFab.style.width = '52px';
-        mmFab.style.height = '52px';
-        mmFab.style.minWidth = '52px';
-        mmFab.style.minHeight = '52px';
-        mmFab.style.maxWidth = '52px';
-        mmFab.style.maxHeight = '52px';
+        mmFab.style.width = '54px';
+        mmFab.style.height = '54px';
+        mmFab.style.minWidth = '54px';
+        mmFab.style.minHeight = '54px';
+        mmFab.style.maxWidth = '54px';
+        mmFab.style.maxHeight = '54px';
         mmFab.style.padding = '0';
         mmFab.style.margin = '0';
         mmFab.style.border = 'none';
@@ -5190,12 +5786,12 @@ function createUi() {
 
         var mmFabImg = mmFab.querySelector('img');
         if (mmFabImg) {
-            mmFabImg.style.width = '52px';
-            mmFabImg.style.height = '52px';
-            mmFabImg.style.minWidth = '52px';
-            mmFabImg.style.minHeight = '52px';
-            mmFabImg.style.maxWidth = '52px';
-            mmFabImg.style.maxHeight = '52px';
+            mmFabImg.style.width = '54px';
+            mmFabImg.style.height = '54px';
+            mmFabImg.style.minWidth = '54px';
+            mmFabImg.style.minHeight = '54px';
+            mmFabImg.style.maxWidth = '54px';
+            mmFabImg.style.maxHeight = '54px';
             mmFabImg.style.objectFit = 'cover';
             mmFabImg.style.objectPosition = 'center center';
             mmFabImg.style.transform = 'scale(1.18)';
@@ -5212,7 +5808,139 @@ function createUi() {
 
     var fabGenerating = false, fabAbort = null;
     var fabDragging = false, fabMoved = false;
+    var fabLongPressTimer = null, fabLongPressFired = false;
     var fabStartX = 0, fabStartY = 0, fabOrigX = 0, fabOrigY = 0;
+
+
+    async function runFabAutoRegexApi() {
+        if (fabGenerating) {
+            return;
+        }
+
+        var ctx = getContext();
+
+        if (!ctx.chat || !ctx.chat.length) {
+            toastr.warning('没有消息');
+            return;
+        }
+
+        var lastIdx = -1;
+
+        for (var gi = ctx.chat.length - 1; gi >= 0; gi--) {
+            if (!ctx.chat[gi].is_user) {
+                lastIdx = gi;
+                break;
+            }
+        }
+
+        if (lastIdx < 0) {
+            toastr.warning('没有AI消息');
+            return;
+        }
+
+        var data = getMessageData(lastIdx);
+
+        if (!data || !data.message || !data.key) {
+            toastr.warning('无法读取当前AI消息');
+            return;
+        }
+
+        fabGenerating = true;
+        fabAbort = { cancelled: false };
+
+        var fab = document.getElementById('mm_fab');
+
+        if (fab) {
+            fab.classList.add('generating');
+        }
+
+        setFabIcon();
+
+        var oldFormatterEnabled = s().formatterEnabled;
+
+        try {
+            if (!s()._undoHistory) {
+                s()._undoHistory = {};
+            }
+
+            if (s().serverHistory && s().serverHistory[data.key]) {
+                s()._undoHistory[data.key] = JSON.parse(JSON.stringify(s().serverHistory[data.key] || {}));
+                delete s().serverHistory[data.key];
+                saveSettingsDebounced();
+
+                activeAudio.pause();
+                activeAudio.src = '';
+                playbackQueue = [];
+                isPlaying = false;
+
+                injectBubbles(lastIdx);
+                refreshAllMessageButtons();
+
+                ttsLog('悬浮按钮长按: 已清除当前楼层旧缓存', 'warn');
+            }
+
+            toastr.info('长按触发：已清除旧音频，正在正则提取...');
+            ttsLog('悬浮按钮长按: 自动正则提取开始');
+
+            s().formatterEnabled = false;
+
+            var regexOk = await generateMessageSpeech(lastIdx, true);
+
+            if (fabAbort && fabAbort.cancelled) {
+                ttsLog('悬浮按钮长按: 已取消', 'warn');
+                return;
+            }
+
+            if (regexOk) {
+                injectBubbles(lastIdx);
+                refreshAllMessageButtons();
+                ttsLog('悬浮按钮长按: 正则提取完成', 'success');
+            } else {
+                ttsLog('悬浮按钮长按: 正则没有提取到内容，继续尝试API分析', 'warn');
+            }
+
+            toastr.info('正在API分析...');
+            ttsLog('悬浮按钮长按: API分析开始');
+
+            s().formatterEnabled = true;
+
+            var apiOk = await generateMessageSpeech(lastIdx, true);
+
+            if (fabAbort && fabAbort.cancelled) {
+                ttsLog('悬浮按钮长按: 已取消', 'warn');
+                return;
+            }
+
+            if (apiOk) {
+                injectBubbles(lastIdx);
+                refreshAllMessageButtons();
+                ttsLog('悬浮按钮长按: 自动正则 + API分析完成', 'success');
+                toastr.success('已清除旧音频，并重新完成正则 + API分析');
+            } else {
+                injectBubbles(lastIdx);
+                refreshAllMessageButtons();
+                ttsLog('悬浮按钮长按: API分析没有生成结果', 'warn');
+                toastr.warning('API分析没有生成结果，请检查LLM预设和日志');
+            }
+        } catch (e) {
+            ttsLog('悬浮按钮长按失败: ' + e.message, 'error');
+            toastr.error('自动分析失败: ' + e.message);
+        } finally {
+            s().formatterEnabled = oldFormatterEnabled;
+            fabGenerating = false;
+            fabAbort = null;
+
+            var fab2 = document.getElementById('mm_fab');
+
+            if (fab2) {
+                fab2.classList.remove('generating');
+            }
+
+            setFabIcon();
+        }
+    }
+
+
 
     function applyFabPosition() {
         var w = document.getElementById('mm_fab_wrap');
@@ -5231,6 +5959,58 @@ function createUi() {
         }
     }
 
+    function applyFabBorderColor() {
+        var wrap = document.getElementById('mm_fab_wrap');
+        var fab = document.getElementById('mm_fab');
+        if (!wrap || !fab) return;
+
+        if (!s().showFloatingBtn) {
+            wrap.style.setProperty('display', 'none', 'important');
+            return;
+        }
+
+        var color = s().floatingBtnBorderColor || '#d9c2ff';
+
+        wrap.style.setProperty('width', '56px', 'important');
+        wrap.style.setProperty('height', '56px', 'important');
+        wrap.style.setProperty('min-width', '56px', 'important');
+        wrap.style.setProperty('min-height', '56px', 'important');
+        wrap.style.setProperty('max-width', '56px', 'important');
+        wrap.style.setProperty('max-height', '56px', 'important');
+        wrap.style.setProperty('border', '2px solid ' + color, 'important');
+        wrap.style.setProperty('border-radius', '50%', 'important');
+        wrap.style.setProperty('box-sizing', 'border-box', 'important');
+        wrap.style.setProperty('box-shadow', '0 0 8px ' + color, 'important');
+        wrap.style.setProperty('overflow', 'visible', 'important');
+        wrap.style.setProperty('display', 'flex', 'important');
+        wrap.style.setProperty('align-items', 'center', 'important');
+        wrap.style.setProperty('justify-content', 'center', 'important');
+
+        fab.style.setProperty('width', '54px', 'important');
+        fab.style.setProperty('height', '54px', 'important');
+        fab.style.setProperty('min-width', '54px', 'important');
+        fab.style.setProperty('min-height', '54px', 'important');
+        fab.style.setProperty('max-width', '54px', 'important');
+        fab.style.setProperty('max-height', '54px', 'important');
+        fab.style.setProperty('border', 'none', 'important');
+        fab.style.setProperty('border-radius', '50%', 'important');
+        fab.style.setProperty('box-sizing', 'border-box', 'important');
+        fab.style.setProperty('overflow', 'hidden', 'important');
+        fab.style.setProperty('box-shadow', 'none', 'important');
+
+        var img = fab.querySelector('img');
+        if (img) {
+            img.style.setProperty('width', '54px', 'important');
+            img.style.setProperty('height', '54px', 'important');
+            img.style.setProperty('min-width', '54px', 'important');
+            img.style.setProperty('min-height', '54px', 'important');
+            img.style.setProperty('max-width', '54px', 'important');
+            img.style.setProperty('max-height', '54px', 'important');
+            img.style.setProperty('border-radius', '50%', 'important');
+            img.style.setProperty('box-sizing', 'border-box', 'important');
+        }
+    }
+
     function setFabIcon() {
         var fab = document.getElementById('mm_fab');
         if (!fab) return;
@@ -5241,14 +6021,22 @@ function createUi() {
         } else {
             fab.innerHTML = '<i class="fa-solid fa-headphones"></i>';
         }
+        applyFabBorderColor();
     }
 
     function updateFabVisibility() {
         var w = document.getElementById('mm_fab_wrap');
+
+        setFabIcon();
+
         if (w) {
-            w.style.display = s().showFloatingBtn ? '' : 'none';
-            applyFabPosition();
-        }setFabIcon();
+            if (s().showFloatingBtn) {
+                w.style.setProperty('display', 'flex', 'important');
+                applyFabPosition();
+            } else {
+                w.style.setProperty('display', 'none', 'important');
+            }
+        }
     }
 
     updateFabVisibility();
@@ -5272,14 +6060,32 @@ function createUi() {
     fabBtn.addEventListener('pointerdown', function (e) {
         if (e.button !== undefined && e.button !== 0) return;
 
+        if (fabGenerating) {
+            return;
+        }
+
         fabDragging = true;
         fabMoved = false;
+        fabLongPressFired = false;
         fabStartX = e.clientX;
         fabStartY = e.clientY;
 
         var rect = fabWrap.getBoundingClientRect();
         fabOrigX = rect.left;
         fabOrigY = rect.top;
+
+        clearTimeout(fabLongPressTimer);
+
+        fabLongPressTimer = setTimeout(function () {
+            if (!fabDragging || fabMoved || fabGenerating) {
+                return;
+            }
+
+            fabLongPressFired = true;
+            fabMoved = true;
+
+            runFabAutoRegexApi();
+        }, 2000);
 
         fabBtn.setPointerCapture && fabBtn.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -5291,7 +6097,10 @@ function createUi() {
         var dx = e.clientX - fabStartX;
         var dy = e.clientY - fabStartY;
 
-        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) fabMoved = true;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+            fabMoved = true;
+            clearTimeout(fabLongPressTimer);
+        }
 
         var nx = fabOrigX + dx;
         var ny = fabOrigY + dy;
@@ -5315,7 +6124,21 @@ function createUi() {
 
     fabBtn.addEventListener('pointerup', function (e) {
         if (!fabDragging) return;
+
+        clearTimeout(fabLongPressTimer);
         fabDragging = false;
+
+        if (fabLongPressFired) {
+            setTimeout(function () {
+                fabLongPressFired = false;
+                fabMoved = false;
+            }, 300);
+
+            fabBtn.releasePointerCapture && fabBtn.releasePointerCapture(e.pointerId);
+            e.preventDefault();
+
+            return;
+        }
 
         if (fabMoved) {
             var rect = fabWrap.getBoundingClientRect();
@@ -5332,16 +6155,25 @@ function createUi() {
     });
 
     fabBtn.addEventListener('pointercancel', function () {
+        clearTimeout(fabLongPressTimer);
         fabDragging = false;
-        setTimeout(function () { fabMoved = false; }, 120);
+
+        setTimeout(function () {
+            fabMoved = false;
+            fabLongPressFired = false;
+        }, 120);
     });
 
     document.getElementById('mm_fab').addEventListener('click', function (e) {
-        console.log('[MiniMax TTS] 点击了 mm_fab（消息操作菜单）');
-
-        if (fabMoved) {
+        if (fabMoved || fabLongPressFired) {
             e.preventDefault();
             e.stopPropagation();
+
+            setTimeout(function () {
+                fabMoved = false;
+                fabLongPressFired = false;
+            }, 300);
+
             return false;
         }
 
@@ -5447,20 +6279,43 @@ jQuery(async function () {
     // 定时刷新
     setInterval(function () {
         refreshAllMessageButtons();
-       }, 3000);
+    }, 3000);
 
     // 行内编辑模式：选中文字后添加气泡
-    $(document).on('mouseup', '#chat .mes_text', function () {
+    $(document).on('mouseup touchend', '#chat .mes_text', function () {
         if (!mmInlineEditState) {
             return;
         }
 
         setTimeout(function () {
             addSelectedTextAsBubble();
-        }, 30);
+        }, 120);
+    });
+
+    document.addEventListener('selectionchange', function () {
+        if (!mmInlineEditState) {
+            return;
+        }
+
+        clearTimeout(window._mmtts_selection_timer);
+
+        window._mmtts_selection_timer = setTimeout(function () {
+            var sel = window.getSelection();
+            var selText = sel ? String(sel.toString() || '').trim() : '';
+            if (selText.length < 1) {
+                return;
+            }
+            addSelectedTextAsBubble();
+        }, 900);
     });
 
     // 长按气泡收藏音频
+    $(document).on('contextmenu', '.mm-bubble', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+    });
+
     $(document).on('mousedown touchstart', '.mm-bubble', function (e) {
         var $b = $(this);
         var mesid = Number($b.data('mesid'));
@@ -5481,12 +6336,22 @@ jQuery(async function () {
                 await favoriteBubbleAudio(mesid, segidx);
             } finally {
                 $b.removeClass('mm-bubble-fav-saving');
+
+                setTimeout(function () {
+                    mmBubbleLongPressFired = false;
+                }, 600);
             }
         }, 700);
     });
 
     $(document).on('mouseup mouseleave touchend touchcancel', '.mm-bubble', function () {
         clearTimeout(mmBubbleLongPressTimer);
+
+        if (mmBubbleLongPressFired) {
+            setTimeout(function () {
+                mmBubbleLongPressFired = false;
+            }, 600);
+        }
     });
 
 
@@ -5498,7 +6363,7 @@ jQuery(async function () {
 
             setTimeout(function () {
                 mmBubbleLongPressFired = false;
-            }, 50);
+            }, 600);
 
             return false;
         }
