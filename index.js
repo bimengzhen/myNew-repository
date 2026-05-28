@@ -1858,7 +1858,26 @@ function openInlineBubbleEditor(mesid) {
     $('#mm_visual_voice_panel').remove();
     $('#mm_favorite_audio_panel').remove();
 
+    if (mmInlineEditState && Number(mmInlineEditState.mesid) !== Number(mesid)) {
+        var ok = confirm('当前还有一条消息正在编辑气泡，是否先取消那条消息的修改并打开新的编辑器？');
+
+        if (!ok) {
+            return;
+        }
+
+        closeInlineBubbleEditor(false);
+    }
+
     console.log('[MiniMax TTS] 打开行内气泡编辑器 mesid=' + mesid);
+
+    if (!s().showBubbles) {
+        s().showBubbles = true;
+        saveSettingsDebounced();
+        var showBubbleCheckbox = document.getElementById('mm_show_bubbles');
+        if (showBubbleCheckbox) {
+            showBubbleCheckbox.checked = true;
+        }
+    }
 
     var data = getMessageData(mesid);
     var message = data.message;
@@ -1937,7 +1956,7 @@ function openInlineBubbleEditor(mesid) {
             bar.style.setProperty('display', 'block', 'important');
             bar.style.setProperty('visibility', 'visible', 'important');
             bar.style.setProperty('opacity', '1', 'important');
-            bar.style.setProperty('pointer-events', isMobileLike ? 'auto' : 'none', 'important');
+            bar.style.setProperty('pointer-events', 'auto', 'important');
             bar.style.setProperty('z-index', '2147483646', 'important');
 
             if (isMobileLike) {
@@ -1960,7 +1979,7 @@ function openInlineBubbleEditor(mesid) {
     if (isMobileLikeDevice()) {
         toastr.info('编辑模式：选中文字添加，点气泡删除。顶部按钮可撤回/确定/取消');
     } else {
-        toastr.info('已进入气泡编辑模式：选中文字即可添加气泡，点击气泡可删除');
+        toastr.info('已进入气泡编辑模式：选中文字添加气泡，点击气泡删除。底部按钮可撤回/取消/确定');
     }
 }
 
@@ -2026,17 +2045,13 @@ function showInlineEditorBar(mesid) {
     var bar = document.createElement('div');
     bar.id = 'mm_inline_editor_bar';
 
-    if (isMobileLike) {
-        bar.innerHTML = ''
-            + '<div style="display:flex;align-items:center;justify-content:center;gap:6px;width:100%;box-sizing:border-box;">'
-            + '<span style="flex:1;min-width:0;text-align:left;font-size:12px;line-height:1.25;">气泡编辑：选中文字添加，点气泡删除</span>'
-            + '<button id="mm_inline_top_undo" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:rgba(60,60,70,.98);color:#fff;font-weight:900;font-size:13px;padding:0;margin:0;">撤回</button>'
-            + '<button id="mm_inline_top_save" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:#f4ead8;color:#5a341e;font-weight:900;font-size:13px;padding:0;margin:0;">确定</button>'
-            + '<button id="mm_inline_top_cancel" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:rgba(120,55,55,.98);color:#fff;font-weight:900;font-size:13px;padding:0;margin:0;">取消</button>'
-            + '</div>';
-    } else {
-        bar.textContent = '气泡编辑模式：选中文字添加气泡，点击气泡删除';
-    }
+    bar.innerHTML = ''
+        + '<div style="display:flex;align-items:center;justify-content:center;gap:8px;width:100%;box-sizing:border-box;">'
+        + '<span style="flex:1;min-width:0;text-align:left;font-size:12px;line-height:1.25;">气泡编辑模式：选中文字添加气泡，点击气泡删除</span>'
+        + '<button id="mm_inline_top_undo" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:rgba(60,60,70,.98);color:#fff;font-weight:900;font-size:13px;padding:0;margin:0;cursor:pointer;">撤回</button>'
+        + '<button id="mm_inline_top_cancel" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:rgba(120,55,55,.98);color:#fff;font-weight:900;font-size:13px;padding:0;margin:0;cursor:pointer;">取消</button>'
+        + '<button id="mm_inline_top_save" type="button" style="flex:0 0 auto;width:52px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.28);background:#f4ead8;color:#5a341e;font-weight:900;font-size:13px;padding:0;margin:0;cursor:pointer;">确定</button>'
+        + '</div>';
 
     document.body.appendChild(bar);
 
@@ -2047,7 +2062,7 @@ function showInlineEditorBar(mesid) {
     bar.style.setProperty('display', 'block', 'important');
     bar.style.setProperty('visibility', 'visible', 'important');
     bar.style.setProperty('opacity', '1', 'important');
-    bar.style.setProperty('pointer-events', isMobileLike ? 'auto' : 'none', 'important');
+    bar.style.setProperty('pointer-events', 'auto', 'important');
     bar.style.setProperty('box-sizing', 'border-box', 'important');
     bar.style.setProperty('background', 'rgba(42, 32, 24, 0.94)', 'important');
     bar.style.setProperty('color', '#fff7e8', 'important');
@@ -2066,70 +2081,72 @@ function showInlineEditorBar(mesid) {
         bar.style.setProperty('border-radius', '12px', 'important');
         bar.style.setProperty('font-size', '12px', 'important');
         bar.style.setProperty('line-height', '1.25', 'important');
-
-        var topUndoBtn = document.getElementById('mm_inline_top_undo');
-        var topSaveBtn = document.getElementById('mm_inline_top_save');
-        var topCancelBtn = document.getElementById('mm_inline_top_cancel');
-
-        function bindInlineTopBtn(btn, fn) {
-            if (!btn) {
-                return;
-            }
-
-            var fired = false;
-
-            function run(e) {
-                e.preventDefault();
-                e.stopPropagation();
-
-                if (e.stopImmediatePropagation) {
-                    e.stopImmediatePropagation();
-                }
-
-                if (fired) {
-                    return false;
-                }
-
-                fired = true;
-
-                setTimeout(function () {
-                    fired = false;
-                }, 180);
-
-                fn();
-                return false;
-            }
-
-            if (window.PointerEvent) {
-                btn.addEventListener('pointerup', run, true);
-            } else {
-                btn.addEventListener('touchend', run, true);
-                btn.addEventListener('click', run, true);
-            }
-        }
-
-        bindInlineTopBtn(topUndoBtn, function () {
-            undoInlineBubbleEdit();
-        });
-
-        bindInlineTopBtn(topSaveBtn, function () {
-            closeInlineBubbleEditor(true);
-        });
-
-        bindInlineTopBtn(topCancelBtn, function () {
-            closeInlineBubbleEditor(false);
-        });
     } else {
         bar.style.setProperty('top', 'auto', 'important');
         bar.style.setProperty('bottom', '24px', 'important');
-        bar.style.setProperty('width', '420px', 'important');
+        bar.style.setProperty('width', '560px', 'important');
         bar.style.setProperty('max-width', 'calc(100vw - 24px)', 'important');
         bar.style.setProperty('padding', '10px 12px', 'important');
         bar.style.setProperty('border-radius', '16px', 'important');
         bar.style.setProperty('font-size', '13px', 'important');
         bar.style.setProperty('line-height', '1.3', 'important');
     }
+
+    var topUndoBtn = document.getElementById('mm_inline_top_undo');
+    var topSaveBtn = document.getElementById('mm_inline_top_save');
+    var topCancelBtn = document.getElementById('mm_inline_top_cancel');
+
+    function bindInlineTopBtn(btn, fn) {
+        if (!btn) {
+            return;
+        }
+
+        var fired = false;
+
+        function run(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (e.stopImmediatePropagation) {
+                e.stopImmediatePropagation();
+            }
+
+            if (fired) {
+                return false;
+            }
+
+            fired = true;
+
+            setTimeout(function () {
+                fired = false;
+            }, 180);
+
+            fn();
+            return false;
+        }
+
+        if (window.PointerEvent) {
+            btn.addEventListener('pointerup', run, true);
+            btn.addEventListener('click', run, true);
+        } else {
+            btn.addEventListener('touchend', run, true);
+            btn.addEventListener('click', run, true);
+        }
+    }
+
+    bindInlineTopBtn(topUndoBtn, function () {
+        undoInlineBubbleEdit();
+    });
+
+    bindInlineTopBtn(topCancelBtn, function () {
+        closeInlineBubbleEditor(false);
+    });
+
+    bindInlineTopBtn(topSaveBtn, function () {
+        closeInlineBubbleEditor(true);
+    });
 }
+
 
 
 
@@ -6271,6 +6288,24 @@ jQuery(async function () {
 
 
     eventSource.on(event_types.CHAT_CHANGED, function () {
+        if (mmInlineEditState) {
+            mmInlineEditState = null;
+        }
+
+        var inlineBar = document.getElementById('mm_inline_editor_bar');
+        if (inlineBar) {
+            inlineBar.remove();
+        }
+
+        ['mm_inline_top_undo', 'mm_inline_top_save', 'mm_inline_top_cancel'].forEach(function (id) {
+            var el = document.getElementById(id);
+            if (el) {
+                el.remove();
+            }
+        });
+
+        clearTimeout(window._mmtts_selection_timer);
+
         setTimeout(refreshAllBubbles, 600);
     });
 
@@ -6304,22 +6339,7 @@ jQuery(async function () {
         }, 120);
     });
 
-    document.addEventListener('selectionchange', function () {
-        if (!mmInlineEditState) {
-            return;
-        }
-
-        clearTimeout(window._mmtts_selection_timer);
-
-        window._mmtts_selection_timer = setTimeout(function () {
-            var sel = window.getSelection();
-            var selText = sel ? String(sel.toString() || '').trim() : '';
-            if (selText.length < 1) {
-                return;
-            }
-            addSelectedTextAsBubble();
-        }, 900);
-    });
+    // 不再用 selectionchange 自动添加气泡，避免一次选中文字被重复添加。
 
     // 长按气泡收藏音频
     $(document).on('contextmenu', '.mm-bubble', function (e) {
