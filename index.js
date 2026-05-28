@@ -5947,8 +5947,20 @@ function createUi() {
         if (!w) return;
 
         if (typeof s().floatingBtnX === 'number' && typeof s().floatingBtnY === 'number') {
-            w.style.left = s().floatingBtnX + 'px';
-            w.style.top = s().floatingBtnY + 'px';
+            // 新增：自动检测当前屏幕大小，限制悬浮球坐标不能超出屏幕可视区域
+            var pad = 10; // 距离屏幕边缘的安全距离
+            var btnWidth = w.offsetWidth || 56;
+            var btnHeight = w.offsetHeight || 56;
+            
+            var maxX = window.innerWidth - btnWidth - pad;
+            var maxY = window.innerHeight - btnHeight - pad;
+            
+            // 限制 X 和 Y 坐标，如果超出了当前手机屏幕，自动拉回屏幕内
+            var x = Math.max(pad, Math.min(maxX, s().floatingBtnX));
+            var y = Math.max(pad, Math.min(maxY, s().floatingBtnY));
+
+            w.style.left = x + 'px';
+            w.style.top = y + 'px';
             w.style.right = 'auto';
             w.style.bottom = 'auto';
         } else {
